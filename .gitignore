@@ -1,0 +1,22 @@
+.DS_Store
+
+# netdb-lang build output
+# netdb-lang/build/
+netdb-lang/
+
+# Go
+/labnetd
+/labnet
+/cmd/labnetd/labnetd
+/cmd/labnet/labnet
+*.test
+*.out
+
+# runtime data
+/data/
+*.db
+*.db-journal
+
+# local CA / certs generated at runtime
+*.pem
+*.key
