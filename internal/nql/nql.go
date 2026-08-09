@@ -7,15 +7,24 @@ package nql
 #include <nql.h>
 #include <stdlib.h>
 
+// cgo cant call a c function pointer directly from go, so these
+// trampolines do it; each mirrors one nql_kernels field's c signature
 static int nql_call_pred(bool (*fn)(const void*), const void* rec) {
 	return fn(rec) ? 1 : 0;
+}
+static uint64_t nql_call_count(uint64_t (*fn)(const void*, uint64_t), const void* base, uint64_t n) {
+	return fn(base, n);
+}
+static uint64_t nql_call_collect(uint64_t (*fn)(const void*, uint64_t, uint64_t*, uint64_t),
+                                 const void* base, uint64_t n, uint64_t* out, uint64_t cap) {
+	return fn(base, n, out, cap);
 }
 */
 import "C"
 
 import (
-	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 )
 
@@ -92,33 +101,60 @@ func (s *Schema) Field(name string) (Field, bool) {
 	return Field{}, false
 }
 
-func (s *Schema) NewRecord() []byte {
-	if s.Size == 0 {
-		return nil
-	}
-	words := make([]uint64, (s.Size+7)/8)
-	return unsafe.Slice((*byte)(unsafe.Pointer(&words[0])), s.Size)
+// zero value: pred/count must not be called, hascollect() is false
+type Kernels struct {
+	ck C.nql_kernels
 }
 
+func (k Kernels) Pred(rec unsafe.Pointer) bool {
+	return C.nql_call_pred(k.ck.pred, rec) != 0
+}
+
+func (k Kernels) Count(base unsafe.Pointer, n uint64) uint64 {
+	return uint64(C.nql_call_count(k.ck.count, base, C.uint64_t(n)))
+}
+
+// false for a query with no where clause: every record matches, caller
+// should just iterate instead
+func (k Kernels) HasCollect() bool {
+	return k.ck.collect != nil
+}
+
+// a returned count equal to len(outIdx) means there may be more matches
+// than fit
+func (k Kernels) Collect(base unsafe.Pointer, n uint64, outIdx []uint64) uint64 {
+	if len(outIdx) == 0 {
+		return 0
+	}
+	return uint64(C.nql_call_collect(k.ck.collect, base, C.uint64_t(n),
+		(*C.uint64_t)(unsafe.Pointer(&outIdx[0])), C.uint64_t(len(outIdx))))
+}
+
+// safe for concurrent use, kernel calls are pure reads; must not be used
+// after Close
 type Program struct {
 	c       *C.nql_program
 	schemas []*Schema
 	byName  map[string]*Schema
 }
 
-func Compile(src string) (*Program, error) {
-	cSrc := C.CString(src)
-	defer C.free(unsafe.Pointer(cSrc))
+// a syntax/type error in usersrc comes back as *compileerror with a
+// line:col relative to usersrc alone, not prelude+usersrc
+func Compile(prelude, userSrc string) (*Program, error) {
+	cPrelude := C.CString(prelude)
+	defer C.free(unsafe.Pointer(cPrelude))
+	cUser := C.CString(userSrc)
+	defer C.free(unsafe.Pointer(cUser))
 
 	var cErr *C.char
-	cProg := C.nql_compile(nil, cSrc, &cErr)
+	cProg := C.nql_compile(cPrelude, cUser, &cErr)
 	if cProg == nil {
-		if cErr == nil {
-			return nil, errors.New("nql: compile failed")
+		msg := "nql_compile failed with no error message"
+		if cErr != nil {
+			msg = C.GoString(cErr)
+			C.nql_free_string(cErr)
 		}
-		msg := C.GoString(cErr)
-		C.nql_free_string(cErr)
-		return nil, fmt.Errorf("nql: %s", msg)
+		return nil, &CompileError{Message: msg}
 	}
 
 	p := &Program{c: cProg, byName: map[string]*Schema{}}
@@ -145,11 +181,18 @@ func Compile(src string) (*Program, error) {
 		p.schemas = append(p.schemas, s)
 		p.byName[s.Name] = s
 	}
+
+	runtime.SetFinalizer(p, (*Program).Close)
 	return p, nil
 }
 
+type CompileError struct{ Message string }
+
+func (e *CompileError) Error() string { return e.Message }
+
 func (p *Program) Close() {
 	if p.c != nil {
+		runtime.SetFinalizer(p, nil)
 		C.nql_free(p.c)
 		p.c = nil
 	}
@@ -162,15 +205,12 @@ func (p *Program) Schema(name string) (*Schema, bool) {
 
 func (p *Program) Schemas() []*Schema { return p.schemas }
 
-func (p *Program) Match(query string, rec []byte) (bool, error) {
-	if len(rec) == 0 {
-		return false, errors.New("nql: empty record")
-	}
-	cName := C.CString(query)
+func (p *Program) QueryKernels(name string) (Kernels, error) {
+	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 	var ck C.nql_kernels
 	if !bool(C.nql_query_kernels(p.c, cName, &ck)) {
-		return false, fmt.Errorf("nql: no such query %q", query)
+		return Kernels{}, fmt.Errorf("nql: no such query %q", name)
 	}
-	return C.nql_call_pred(ck.pred, unsafe.Pointer(&rec[0])) != 0, nil
+	return Kernels{ck: ck}, nil
 }
