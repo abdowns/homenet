@@ -1,9 +1,12 @@
 package journal
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 	"unsafe"
 
 	"labnet/internal/nql"
@@ -15,7 +18,77 @@ const (
 	maxSegs = 16
 )
 
-type Row map[string]any
+type FieldValue struct {
+	Name  string
+	Value any
+}
+
+type Row []FieldValue
+
+func (r Row) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, fv := range r {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		nameJSON, err := json.Marshal(fv.Name)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(nameJSON)
+		buf.WriteByte(':')
+		valJSON, err := json.Marshal(fv.Value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(valJSON)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// token stream keeps field order; json.number avoids float64 precision
+// loss on large u64 values like a millisecond timestamp
+func (r *Row) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("journal: Row: expected a JSON object, got %v", tok)
+	}
+	var out Row
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("journal: Row: expected a string key, got %v", keyTok)
+		}
+		var val any
+		if err := dec.Decode(&val); err != nil {
+			return err
+		}
+		out = append(out, FieldValue{Name: key, Value: val})
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	*r = out
+	return nil
+}
+
+type QueryStats struct {
+	CompileMS float64
+	ScanMS    float64
+	Scanned   uint64
+	Matched   uint64
+}
 
 type segment struct {
 	buf   *nql.Buf
@@ -81,44 +154,65 @@ func (r *Ring) Close() {
 	r.segs = nil
 }
 
-func (r *Ring) Query(predicate string, limit int) ([]Row, error) {
+func (r *Ring) Count(k nql.Kernels) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var total uint64
+	for _, s := range r.segs {
+		total += k.Count(s.buf.Base(), uint64(s.count))
+	}
+	return total
+}
+
+func (r *Ring) Query(predicate string, limit int) ([]Row, QueryStats, error) {
+	var stats QueryStats
+
+	t0 := time.Now()
 	src := fmt.Sprintf("filter __adhoc(r: %s) {\n%s\n}\n", r.schemaName, predicate)
 	prog, err := nql.Compile(schema.Prelude, src)
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 	defer prog.Close()
+	stats.CompileMS = msSince(t0)
 
 	k, ok := prog.FilterKernels("__adhoc")
 	if !ok {
-		return nil, fmt.Errorf("journal: internal error: __adhoc filter missing after compile")
+		return nil, stats, fmt.Errorf("journal: internal error: __adhoc filter missing after compile")
 	}
 
+	t1 := time.Now()
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	var rows []Row
 	for _, s := range r.segs {
-		if s.count == 0 {
+		n := uint64(s.count)
+		stats.Scanned += n
+		if n == 0 {
 			continue
 		}
-		idx := make([]uint64, s.count)
-		got := k.Collect(s.buf.Base(), uint64(s.count), idx)
+		idx := make([]uint64, n)
+		got := k.Collect(s.buf.Base(), n, idx)
 		for _, i := range idx[:got] {
 			rows = append(rows, decodeRow(r.sch, s.buf.Rec(int(i))))
 		}
 	}
+	r.mu.RUnlock()
+	stats.ScanMS = msSince(t1)
+	stats.Matched = uint64(len(rows))
 
 	sort.Slice(rows, func(i, j int) bool { return ts(rows[i]) > ts(rows[j]) })
 	if limit > 0 && len(rows) > limit {
 		rows = rows[:limit]
 	}
-	return rows, nil
+	return rows, stats, nil
 }
+
+func msSince(t0 time.Time) float64 { return float64(time.Since(t0)) / float64(time.Millisecond) }
 
 func decodeRow(sch *nql.Schema, rec unsafe.Pointer) Row {
 	row := make(Row, len(sch.Fields))
-	for _, f := range sch.Fields {
-		row[f.Name] = decodeValue(rec, f)
+	for i, f := range sch.Fields {
+		row[i] = FieldValue{Name: f.Name, Value: decodeValue(rec, f)}
 	}
 	return row
 }
@@ -142,6 +236,13 @@ func decodeValue(rec unsafe.Pointer, f nql.Field) any {
 }
 
 func ts(r Row) uint64 {
-	v, _ := r["ts"].(uint64)
-	return v
+	for _, fv := range r {
+		if fv.Name == "ts" {
+			if v, ok := fv.Value.(uint64); ok {
+				return v
+			}
+			return 0
+		}
+	}
+	panic("journal: row has no ts field — every schema in schema.Prelude must declare one")
 }
