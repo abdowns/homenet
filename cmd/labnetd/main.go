@@ -10,13 +10,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"labnet/internal/api"
+	"labnet/internal/ca"
 	labnetdns "labnet/internal/dns"
 	"labnet/internal/journal"
 	"labnet/internal/nql"
+	"labnet/internal/proxy"
 	"labnet/internal/schema"
 )
 
@@ -34,8 +37,14 @@ func run() error {
 	dnsAddr := flag.String("dns-addr", "127.0.0.1:5353",
 		"address to serve DNS on (use \":53\" for real use, which needs root/CAP_NET_BIND_SERVICE)")
 	apiAddr := flag.String("api-addr", "127.0.0.1:8080", "address to serve the control API on (used by the labnet CLI)")
+	proxyAddr := flag.String("proxy-addr", "127.0.0.1:8443",
+		"address to serve the HTTPS reverse proxy on (use \":443\" for real use)")
+	proxyPlainAddr := flag.String("proxy-plain-addr", "127.0.0.1:8000",
+		"address to serve /ca (root cert download) and the https redirect on (use \":80\" for real use)")
 	upstream := flag.String("upstream", "1.1.1.1:53", "upstream DNS resolver for names outside zone")
 	hostIPFlag := flag.String("host-ip", "", "IP to answer for every name in zone (default: auto-detected)")
+	dataDir := flag.String("data-dir", "./data", "directory to persist the local CA (and, later, other state) in")
+	routes := flag.String("routes", "", "comma-separated name=host:port backends to proxy as <name>.<zone>, e.g. grafana=127.0.0.1:3000")
 	flag.Parse()
 
 	hostIP := net.ParseIP(*hostIPFlag)
@@ -59,6 +68,11 @@ func run() error {
 		return fmt.Errorf("creating DNS journal: %w", err)
 	}
 	defer dnsRing.Close()
+	httpRing, err := journal.NewRing(prog, "HttpRequest", journalCapacity)
+	if err != nil {
+		return fmt.Errorf("creating HTTP journal: %w", err)
+	}
+	defer httpRing.Close()
 
 	dnsHandler, err := labnetdns.NewHandler(labnetdns.Config{
 		Zone: *zone, HostIP: hostIP, Upstream: *upstream, Journal: dnsRing,
@@ -72,10 +86,27 @@ func run() error {
 	}
 	log.Printf("labnetd: DNS serving zone %q on %s -> %s (upstream %s)", *zone, dnsServer.Addr(), hostIP, *upstream)
 
-	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing})
+	authority, err := ca.LoadOrCreate(*dataDir)
+	if err != nil {
+		return fmt.Errorf("setting up local CA: %w", err)
+	}
+	registry := proxy.NewRegistry()
+	for _, r := range strings.Split(*routes, ",") {
+		name, backend, ok := strings.Cut(strings.TrimSpace(r), "=")
+		if !ok {
+			continue
+		}
+		registry.Set(name, backend)
+		log.Printf("labnetd: routing %s.%s -> %s", name, *zone, backend)
+	}
+	proxyHandler := &proxy.Proxy{Registry: registry, Journal: httpRing}
+	tlsServer := proxy.NewTLSServer(*proxyAddr, proxyHandler, authority)
+	plainServer := proxy.NewPlainServer(*proxyPlainAddr, *proxyAddr, authority)
+
+	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing}, registry)
 	apiServer := &http.Server{Addr: *apiAddr, Handler: apiHandler}
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 4)
 	go func() {
 		if err := dnsServer.Serve(); err != nil {
 			errc <- fmt.Errorf("DNS server: %w", err)
@@ -85,6 +116,18 @@ func run() error {
 		log.Printf("labnetd: control API on http://%s", *apiAddr)
 		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- fmt.Errorf("control API server: %w", err)
+		}
+	}()
+	go func() {
+		log.Printf("labnetd: HTTPS reverse proxy on https://%s", *proxyAddr)
+		if err := tlsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errc <- fmt.Errorf("reverse proxy server: %w", err)
+		}
+	}()
+	go func() {
+		log.Printf("labnetd: root CA download at http://%s/ca", *proxyPlainAddr)
+		if err := plainServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errc <- fmt.Errorf("plain HTTP server: %w", err)
 		}
 	}()
 
@@ -101,6 +144,8 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	apiServer.Shutdown(shutdownCtx)
+	tlsServer.Shutdown(shutdownCtx)
+	plainServer.Shutdown(shutdownCtx)
 	dnsServer.Shutdown()
 	return nil
 }
