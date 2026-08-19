@@ -8,6 +8,7 @@ import (
 )
 
 type Service struct {
+	Name   string
 	Host   string
 	Target *url.URL
 
@@ -19,29 +20,55 @@ type Registry struct {
 	byHost map[string]*Service
 }
 
+func normalizeHost(h string) string {
+	return strings.ToLower(strings.TrimSuffix(h, "."))
+}
+
 func NewRegistry() *Registry {
 	return &Registry{byHost: map[string]*Service{}}
 }
 
-func (r *Registry) Register(host string, target *url.URL) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.byHost[strings.ToLower(host)] = &Service{
-		Host:   host,
+func (r *Registry) Register(name, host string, target *url.URL) *Service {
+	svc := &Service{
+		Name:   name,
+		Host:   normalizeHost(host),
 		Target: target,
 		rp:     httputil.NewSingleHostReverseProxy(target),
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byHost[svc.Host] = svc
+	return svc
 }
 
+func (r *Registry) Deregister(host string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.byHost, normalizeHost(host))
+}
+
+// host may include a port; callers should strip it first via StripPort
 func (r *Registry) Lookup(host string) (*Service, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	svc, ok := r.byHost[strings.ToLower(host)]
+	svc, ok := r.byHost[normalizeHost(host)]
 	return svc, ok
 }
 
+func (r *Registry) List() []*Service {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*Service, 0, len(r.byHost))
+	for _, svc := range r.byHost {
+		out = append(out, svc)
+	}
+	return out
+}
+
+// a bracketless IPv6 host can't appear in a valid Host header, so a plain
+// LastIndex is safe here
 func StripPort(host string) string {
-	if i := strings.Index(host, ":"); i != -1 {
+	if i := strings.LastIndex(host, ":"); i != -1 {
 		return host[:i]
 	}
 	return host
