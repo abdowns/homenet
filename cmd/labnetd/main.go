@@ -10,13 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"labnet/internal/api"
 	"labnet/internal/ca"
 	labnetdns "labnet/internal/dns"
+	"labnet/internal/docker"
 	"labnet/internal/journal"
 	"labnet/internal/nql"
 	"labnet/internal/proxy"
@@ -44,7 +44,8 @@ func run() error {
 	upstream := flag.String("upstream", "1.1.1.1:53", "upstream DNS resolver for names outside zone")
 	hostIPFlag := flag.String("host-ip", "", "IP to answer for every name in zone (default: auto-detected)")
 	dataDir := flag.String("data-dir", "./data", "directory to persist the local CA (and, later, other state) in")
-	routes := flag.String("routes", "", "comma-separated name=host:port backends to proxy as <name>.<zone>, e.g. grafana=127.0.0.1:3000")
+	dockerSocket := flag.String("docker-socket", "/var/run/docker.sock", "Docker Engine API socket path")
+	dockerNetwork := flag.String("docker-network", "labnet", "Docker network `labnet up` attaches services to")
 	flag.Parse()
 
 	hostIP := net.ParseIP(*hostIPFlag)
@@ -91,20 +92,28 @@ func run() error {
 		return fmt.Errorf("setting up local CA: %w", err)
 	}
 	registry := proxy.NewRegistry()
-	for _, r := range strings.Split(*routes, ",") {
-		name, backend, ok := strings.Cut(strings.TrimSpace(r), "=")
-		if !ok {
-			continue
-		}
-		registry.Set(name, backend)
-		log.Printf("labnetd: routing %s.%s -> %s", name, *zone, backend)
-	}
 	proxyHandler := &proxy.Proxy{Registry: registry, Journal: httpRing}
 	tlsServer := proxy.NewTLSServer(*proxyAddr, proxyHandler, authority)
 	plainServer := proxy.NewPlainServer(*proxyPlainAddr, *proxyAddr, authority)
 
-	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing}, registry)
+	sdk := docker.NewSDKClient(*dockerSocket)
+	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err = sdk.ListContainers(probeCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("connecting to Docker at %s: %w", *dockerSocket, err)
+	}
+	discovery := docker.NewDiscovery(sdk, registry, 5*time.Second)
+	log.Printf("labnetd: Docker discovery active on network %q", *dockerNetwork)
+
+	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing},
+		api.Services{Registry: registry, Docker: sdk, Discovery: discovery, DockerNetwork: *dockerNetwork},
+	)
 	apiServer := &http.Server{Addr: *apiAddr, Handler: apiHandler}
+
+	ctx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+	go discovery.Run(ctx)
 
 	errc := make(chan error, 4)
 	go func() {
