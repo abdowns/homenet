@@ -41,10 +41,28 @@ func (r *Registry) Register(name, host string, target *url.URL) *Service {
 	return svc
 }
 
-func (r *Registry) Deregister(host string) {
+func (r *Registry) Deregister(host string) bool {
+	host = normalizeHost(host)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.byHost, normalizeHost(host))
+	if _, ok := r.byHost[host]; !ok {
+		return false
+	}
+	delete(r.byHost, host)
+	return true
+}
+
+// at most one match: Register overwrites any existing entry for a host
+func (r *Registry) DeregisterByName(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for host, svc := range r.byHost {
+		if svc.Name == name {
+			delete(r.byHost, host)
+			return true
+		}
+	}
+	return false
 }
 
 // host may include a port; callers should strip it first via StripPort

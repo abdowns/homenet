@@ -13,21 +13,26 @@ type fakeClient struct {
 }
 
 func (f *fakeClient) ListContainers(ctx context.Context) ([]Container, error) {
-	c := f.polls[f.n]
-	if f.n < len(f.polls)-1 {
-		f.n++
+	if f.n >= len(f.polls) {
+		return f.polls[len(f.polls)-1], nil
 	}
+	c := f.polls[f.n]
+	f.n++
 	return c, nil
 }
+func (f *fakeClient) EnsureNetwork(ctx context.Context, name string) error        { return nil }
+func (f *fakeClient) BuildImage(ctx context.Context, dir, tag string) error       { return nil }
+func (f *fakeClient) RunContainer(ctx context.Context, s RunSpec) (string, error) { return "", nil }
+func (f *fakeClient) StopAndRemove(ctx context.Context, name string) error        { return nil }
 
 func TestDiscoveryRegistersAndDeregisters(t *testing.T) {
 	fc := &fakeClient{polls: [][]Container{
 		{
-			{ID: "c1", Name: "app", Running: true, IP: "172.18.0.2",
+			{ID: "c1", Name: "app", Running: true, HostPort: "32768",
 				Labels: map[string]string{LabelHost: "app.lab"}},
 		},
 		{
-			{ID: "c1", Name: "app", Running: false, IP: "",
+			{ID: "c1", Name: "app", Running: false, HostPort: "",
 				Labels: map[string]string{LabelHost: "app.lab"}},
 		},
 	}}
@@ -45,8 +50,8 @@ func TestDiscoveryRegistersAndDeregisters(t *testing.T) {
 	if !ok {
 		t.Fatal("app.lab not registered after poll 1")
 	}
-	if svc.Target.Host != "172.18.0.2:80" {
-		t.Errorf("target = %s, want 172.18.0.2:80", svc.Target.Host)
+	if svc.Target.Host != "127.0.0.1:32768" {
+		t.Errorf("target = %s, want 127.0.0.1:32768", svc.Target.Host)
 	}
 
 	n, err = d.PollOnce(context.Background())
@@ -61,10 +66,31 @@ func TestDiscoveryRegistersAndDeregisters(t *testing.T) {
 	}
 }
 
+func TestDiscoveryHonorsPortLabel(t *testing.T) {
+	fc := &fakeClient{polls: [][]Container{{
+		{ID: "c1", Name: "vite", Running: true, HostPort: "40001",
+			Labels: map[string]string{LabelHost: "vite.lab", LabelPort: "5173"}},
+	}}}
+	reg := proxy.NewRegistry()
+	d := NewDiscovery(fc, reg, 0)
+	if _, err := d.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	svc, ok := reg.Lookup("vite.lab")
+	if !ok {
+		t.Fatal("vite.lab not registered")
+	}
+	if svc.Target.Host != "127.0.0.1:40001" {
+		t.Errorf("target = %s, want 127.0.0.1:40001", svc.Target.Host)
+	}
+}
+
 func TestDiscoveryIgnoresUnlabeledAndIPlessContainers(t *testing.T) {
 	fc := &fakeClient{polls: [][]Container{{
-		{ID: "c1", Name: "no-label", Running: true, IP: "172.18.0.3"},
-		{ID: "c2", Name: "no-ip", Running: true, Labels: map[string]string{LabelHost: "noip.lab"}},
+		{ID: "c1", Name: "no-label", Running: true, HostPort: "40002"},
+		{ID: "c2", Name: "no-port", Running: true, Labels: map[string]string{LabelHost: "noip.lab"}},
+		{ID: "c3", Name: "not-running", Running: false, HostPort: "40003",
+			Labels: map[string]string{LabelHost: "stopped.lab"}},
 	}}}
 	reg := proxy.NewRegistry()
 	d := NewDiscovery(fc, reg, 0)
@@ -74,5 +100,8 @@ func TestDiscoveryIgnoresUnlabeledAndIPlessContainers(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("expected 0 services, got %d", n)
+	}
+	if len(reg.List()) != 0 {
+		t.Fatalf("expected empty registry, got %d entries", len(reg.List()))
 	}
 }
