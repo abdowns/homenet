@@ -190,12 +190,15 @@ type CompileError struct{ Message string }
 
 func (e *CompileError) Error() string { return e.Message }
 
-func (p *Program) Close() {
+// must not be called while any goroutine may still call this programs
+// kernels
+func (p *Program) Close() error {
 	if p.c != nil {
 		runtime.SetFinalizer(p, nil)
 		C.nql_free(p.c)
 		p.c = nil
 	}
+	return nil
 }
 
 func (p *Program) Schema(name string) (*Schema, bool) {
@@ -205,12 +208,49 @@ func (p *Program) Schema(name string) (*Schema, bool) {
 
 func (p *Program) Schemas() []*Schema { return p.schemas }
 
-func (p *Program) QueryKernels(name string) (Kernels, error) {
+type FilterInfo struct {
+	Name       string
+	SchemaName string
+}
+
+func (p *Program) Filters() []FilterInfo {
+	n := int(C.nql_filter_count(p.c))
+	out := make([]FilterInfo, n)
+	for i := 0; i < n; i++ {
+		out[i] = FilterInfo{
+			Name:       C.GoString(C.nql_filter_name_at(p.c, C.size_t(i))),
+			SchemaName: C.GoString(C.nql_filter_schema_at(p.c, C.size_t(i))),
+		}
+	}
+	return out
+}
+
+func (p *Program) FilterKernels(name string) (Kernels, bool) {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	var ck C.nql_kernels
+	if !bool(C.nql_filter_kernels(p.c, cName, &ck)) {
+		return Kernels{}, false
+	}
+	return Kernels{ck: ck}, true
+}
+
+func (p *Program) QueryKernels(name string) (Kernels, bool) {
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 	var ck C.nql_kernels
 	if !bool(C.nql_query_kernels(p.c, cName, &ck)) {
-		return Kernels{}, fmt.Errorf("nql: no such query %q", name)
+		return Kernels{}, false
 	}
-	return Kernels{ck: ck}, nil
+	return Kernels{ck: ck}, true
+}
+
+func (p *Program) EvalFilterInterp(name string, rec unsafe.Pointer) (bool, error) {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	r := C.nql_eval_filter_interp(p.c, cName, rec)
+	if r < 0 {
+		return false, fmt.Errorf("nql: no such filter %q", name)
+	}
+	return r != 0, nil
 }

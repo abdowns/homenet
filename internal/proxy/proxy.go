@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,9 +12,12 @@ import (
 	"labnet/internal/schema"
 )
 
+type PolicyFunc func(r schema.HttpRequest) (deny bool)
+
 type Proxy struct {
 	Registry *Registry
 	Journal  *journal.Ring
+	Policy   PolicyFunc // nil: never deny
 }
 
 func clientAddr(remote string) [4]byte {
@@ -31,14 +35,6 @@ func clientAddr(remote string) [4]byte {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t0 := time.Now()
 	host := StripPort(r.Host)
-	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-
-	svc, ok := p.Registry.Lookup(host)
-	if ok {
-		svc.rp.ServeHTTP(sw, r)
-	} else {
-		http.Error(sw, fmt.Sprintf("labnet: no service registered for %q", host), http.StatusNotFound)
-	}
 
 	rec := schema.HttpRequest{
 		TS:     uint64(t0.UnixMilli()),
@@ -47,28 +43,53 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Method: r.Method,
 		Path:   r.URL.Path,
 		Agent:  r.UserAgent(),
-		Status: uint16(sw.status),
-		Bytes:  uint32(sw.bytes),
-		MS:     float64(time.Since(t0)) / float64(time.Millisecond),
 	}
-	if ok {
+
+	// rec.service must be set before Policy runs, since a rule can
+	// key on it (e.g. r.service == "admin") and would never match a blank one
+	svc, foundSvc := p.Registry.Lookup(host)
+	if foundSvc {
 		rec.Service = svc.Name
 	}
+
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+
+	switch {
+	case p.Policy != nil && p.Policy(rec):
+		http.Error(sw, "labnet: denied by policy", http.StatusForbidden)
+	case !foundSvc:
+		http.Error(sw, fmt.Sprintf("labnet: no service registered for %q (try `labnet up` or `labnet expose`)", host), http.StatusNotFound)
+	default:
+		svc.rp.ServeHTTP(sw, r)
+	}
+
+	rec.Status = uint16(sw.status)
+	rec.Bytes = uint32(sw.bytes)
+	rec.MS = float64(time.Since(t0)) / float64(time.Millisecond)
 	p.Journal.Append(func(buf *nql.Buf, i int) { schema.PackHttpRequest(buf, i, rec) })
 }
 
+// passes through Flush/Hijack so streaming and websocket/hmr upgrades keep working
 type statusWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
+	status      int
+	bytes       int64
+	wroteHeader bool
 }
 
 func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *statusWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.status = http.StatusOK
+		w.wroteHeader = true
+	}
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += int64(n)
 	return n, err
@@ -78,4 +99,12 @@ func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("labnet: underlying ResponseWriter does not support hijacking")
+	}
+	return hj.Hijack()
 }
