@@ -3,74 +3,82 @@
 package policy
 
 import (
+	"fmt"
 	"strings"
 
 	"labnet/internal/nql"
 	"labnet/internal/schema"
 )
 
+type rule struct {
+	name string
+	k    nql.Kernels
+}
+
 type Policy struct {
 	prog *nql.Program
 
-	deny  map[string]nql.Kernels
-	block map[string]nql.Kernels
+	denyHTTP []rule
+	blockDNS []rule
 }
 
+// empty src compiles fine and denies nothing
 func Compile(src string) (*Policy, error) {
-	p := &Policy{deny: map[string]nql.Kernels{}, block: map[string]nql.Kernels{}}
-	if strings.TrimSpace(src) == "" {
-		return p, nil
-	}
 	prog, err := nql.Compile(schema.Prelude, src)
 	if err != nil {
 		return nil, err
 	}
-	p.prog = prog
+	p := &Policy{prog: prog}
 	for _, fi := range prog.Filters() {
 		k, ok := prog.FilterKernels(fi.Name)
 		if !ok {
-			continue
+			continue // unreachable: fi came from this same prog
 		}
+		r := rule{name: fi.Name, k: k}
 		switch {
 		case fi.SchemaName == "HttpRequest" && strings.HasPrefix(fi.Name, "deny_"):
-			p.deny[fi.Name] = k
+			p.denyHTTP = append(p.denyHTTP, r)
 		case fi.SchemaName == "DnsQuery" && strings.HasPrefix(fi.Name, "block_"):
-			p.block[fi.Name] = k
+			p.blockDNS = append(p.blockDNS, r)
 		}
 	}
 	return p, nil
 }
 
-func (p *Policy) DenyHTTP(r schema.HttpRequest) (bool, string) {
-	if len(p.deny) == 0 {
+func (p *Policy) Close() { p.prog.Close() }
+
+func (p *Policy) Summary() string {
+	return fmt.Sprintf("%d deny_, %d block_", len(p.denyHTTP), len(p.blockDNS))
+}
+
+func evalFirst(prog *nql.Program, schemaName string, rules []rule, fill func(buf *nql.Buf, i int)) (matched bool, name string) {
+	if len(rules) == 0 {
 		return false, ""
 	}
-	sch, _ := p.prog.Schema("HttpRequest")
+	sch, ok := prog.Schema(schemaName)
+	if !ok {
+		return false, "" // schema.Prelude always declares it; defensive only
+	}
 	buf := nql.NewBuf(sch, 1)
 	defer buf.Free()
-	schema.PackHttpRequest(buf, 0, r)
+	fill(buf, 0)
 	rec := buf.Rec(0)
-	for name, k := range p.deny {
-		if k.Pred(rec) {
-			return true, name
+	for _, r := range rules {
+		if r.k.Pred(rec) {
+			return true, r.name
 		}
 	}
 	return false, ""
 }
 
+func (p *Policy) DenyHTTP(r schema.HttpRequest) (bool, string) {
+	return evalFirst(p.prog, "HttpRequest", p.denyHTTP, func(buf *nql.Buf, i int) {
+		schema.PackHttpRequest(buf, i, r)
+	})
+}
+
 func (p *Policy) BlockDNS(q schema.DnsQuery) (bool, string) {
-	if len(p.block) == 0 {
-		return false, ""
-	}
-	sch, _ := p.prog.Schema("DnsQuery")
-	buf := nql.NewBuf(sch, 1)
-	defer buf.Free()
-	schema.PackDnsQuery(buf, 0, q)
-	rec := buf.Rec(0)
-	for name, k := range p.block {
-		if k.Pred(rec) {
-			return true, name
-		}
-	}
-	return false, ""
+	return evalFirst(p.prog, "DnsQuery", p.blockDNS, func(buf *nql.Buf, i int) {
+		schema.PackDnsQuery(buf, i, q)
+	})
 }

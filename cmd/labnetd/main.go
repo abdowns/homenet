@@ -19,6 +19,7 @@ import (
 	"labnet/internal/docker"
 	"labnet/internal/journal"
 	"labnet/internal/nql"
+	"labnet/internal/policy"
 	"labnet/internal/proxy"
 	"labnet/internal/schema"
 )
@@ -44,6 +45,8 @@ func run() error {
 	upstream := flag.String("upstream", "1.1.1.1:53", "upstream DNS resolver for names outside zone")
 	hostIPFlag := flag.String("host-ip", "", "IP to answer for every name in zone (default: auto-detected)")
 	dataDir := flag.String("data-dir", "./data", "directory to persist the local CA (and, later, other state) in")
+	policyFile := flag.String("policy-file", "./policies/policy.nql",
+		"NQL policy file, hot-reloaded on save (see internal/policy); missing is treated as an empty, no-op policy")
 	dockerSocket := flag.String("docker-socket", "/var/run/docker.sock", "Docker Engine API socket path")
 	dockerNetwork := flag.String("docker-network", "labnet", "Docker network `labnet up` attaches services to")
 	flag.Parse()
@@ -75,8 +78,24 @@ func run() error {
 	}
 	defer httpRing.Close()
 
+	policyMgr, err := policy.NewManager(*policyFile)
+	if err != nil {
+		return fmt.Errorf("loading policy: %w", err)
+	}
+	alertLog := policy.NewAlertLog(200)
+	raiseAlerts := func(schemaName string, names []string, summary string) {
+		for _, rule := range names {
+			log.Printf("labnetd: ALERT %s (%s): %s", rule, schemaName, summary)
+			alertLog.Add(policy.Alert{TS: uint64(time.Now().UnixMilli()), Schema: schemaName, Rule: rule, Summary: summary})
+		}
+	}
+
 	dnsHandler, err := labnetdns.NewHandler(labnetdns.Config{
 		Zone: *zone, HostIP: hostIP, Upstream: *upstream, Journal: dnsRing,
+		Policy: func(q schema.DnsQuery) bool { blocked, _ := policyMgr.Current().BlockDNS(q); return blocked },
+		OnComplete: func(q schema.DnsQuery) {
+			raiseAlerts("DnsQuery", policyMgr.Current().AlertsDNS(q), fmt.Sprintf("name=%s blocked=%v", q.Name, q.Blocked))
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("building DNS handler: %w", err)
@@ -92,7 +111,13 @@ func run() error {
 		return fmt.Errorf("setting up local CA: %w", err)
 	}
 	registry := proxy.NewRegistry()
-	proxyHandler := &proxy.Proxy{Registry: registry, Journal: httpRing}
+	proxyHandler := &proxy.Proxy{
+		Registry: registry, Journal: httpRing,
+		Policy: func(r schema.HttpRequest) bool { denied, _ := policyMgr.Current().DenyHTTP(r); return denied },
+		OnComplete: func(r schema.HttpRequest) {
+			raiseAlerts("HttpRequest", policyMgr.Current().AlertsHTTP(r), fmt.Sprintf("%s %s -> %d", r.Method, r.Path, r.Status))
+		},
+	}
 	tlsServer := proxy.NewTLSServer(*proxyAddr, proxyHandler, authority)
 	plainServer := proxy.NewPlainServer(*proxyPlainAddr, *proxyAddr, authority)
 
@@ -108,12 +133,19 @@ func run() error {
 
 	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing},
 		api.Services{Registry: registry, Docker: sdk, Discovery: discovery, DockerNetwork: *dockerNetwork},
+		api.PolicyDeps{Manager: policyMgr, Alerts: alertLog},
 	)
 	apiServer := &http.Server{Addr: *apiAddr, Handler: apiHandler}
 
 	ctx, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
 	go discovery.Run(ctx)
+	go func() {
+		if err := policyMgr.Watch(ctx.Done()); err != nil {
+			log.Printf("labnetd: policy watcher stopped: %v", err)
+		}
+	}()
+	log.Printf("labnetd: policy loaded from %s (%s)", *policyFile, ruleSummary(policyMgr.Current().RuleNames()))
 
 	errc := make(chan error, 4)
 	go func() {
@@ -175,4 +207,16 @@ func detectHostIP() (net.IP, error) {
 		}
 	}
 	return nil, fmt.Errorf("no non-loopback IPv4 address found")
+}
+
+func ruleSummary(rules map[string][]string) string {
+	total := 0
+	for _, names := range rules {
+		total += len(names)
+	}
+	if total == 0 {
+		return "no rules — every request/query is allowed"
+	}
+	return fmt.Sprintf("%d deny_, %d allow_, %d block_, %d alert_ rule(s)",
+		len(rules["deny_"]), len(rules["allow_"]), len(rules["block_"]), len(rules["alert_"]))
 }
