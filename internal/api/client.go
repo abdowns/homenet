@@ -68,7 +68,7 @@ func (c *Client) Expose(req ExposeRequest) (*ServiceInfo, error) {
 	return &out, nil
 }
 
-func (c *Client) ListServices() (*ListServicesResponse, error) {
+func (c *Client) ListServices() ([]ServiceInfo, error) {
 	resp, err := c.http.Get(c.baseURL + "/api/services")
 	if err != nil {
 		return nil, fmt.Errorf("labnetd unreachable at %s: %w", c.baseURL, err)
@@ -78,7 +78,7 @@ func (c *Client) ListServices() (*ListServicesResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
-	return &out, nil
+	return out.Services, nil
 }
 
 func (c *Client) postJSON(path string, req, out any) error {
@@ -95,6 +95,19 @@ func (c *Client) postJSON(path string, req, out any) error {
 		return fmt.Errorf("decoding response: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) Alerts(limit int) ([]Alert, error) {
+	resp, err := c.http.Get(fmt.Sprintf("%s/api/alerts?limit=%d", c.baseURL, limit))
+	if err != nil {
+		return nil, fmt.Errorf("labnetd unreachable at %s: %w", c.baseURL, err)
+	}
+	defer resp.Body.Close()
+	var out AlertsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return out.Alerts, nil
 }
 
 func (c *Client) Status() (*StatusResponse, error) {

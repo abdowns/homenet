@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"labnet/internal/api"
 )
@@ -43,6 +44,8 @@ func run(args []string) error {
 		return cmdExpose(client, args[1:])
 	case "ls":
 		return cmdList(client)
+	case "alerts":
+		return cmdAlerts(client)
 	default:
 		return usageError()
 	}
@@ -66,6 +69,8 @@ func usageError() error {
       Docker involved: labnet expose vite http://127.0.0.1:5173
   labnet ls
       list every registered service
+  labnet alerts
+      show recent alert rule matches
 
 LABNET_API (default http://127.0.0.1:8080) sets the labnetd control API
 address.`)
@@ -177,6 +182,21 @@ func cmdList(client *api.Client) error {
 	return nil
 }
 
+func cmdAlerts(client *api.Client) error {
+	alerts, err := client.Alerts()
+	if err != nil {
+		return err
+	}
+	if len(alerts) == 0 {
+		fmt.Println("no alerts")
+		return nil
+	}
+	for _, a := range alerts {
+		fmt.Printf("[%s] %-24s %s: %s\n", time.UnixMilli(int64(a.TS)).Format(time.RFC3339), a.Rule, a.Schema, a.Summary)
+	}
+	return nil
+}
+
 func cmdStatus(client *api.Client) error {
 	st, err := client.Status()
 	if err != nil {
@@ -189,8 +209,12 @@ func cmdStatus(client *api.Client) error {
 		fmt.Printf("  %-12s %6d held / %8d lifetime\n", name, counts.Len, counts.Total)
 	}
 	fmt.Println("schemas:")
-	for name := range st.Schemas {
-		fmt.Printf("  %s\n", name)
+	for name, fields := range st.Schemas {
+		var parts []string
+		for _, f := range fields {
+			parts = append(parts, f.Name+":"+f.Type)
+		}
+		fmt.Printf("  %-12s %s\n", name, strings.Join(parts, " "))
 	}
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"labnet/internal/docker"
 	"labnet/internal/journal"
 	"labnet/internal/nql"
+	"labnet/internal/policy"
 	"labnet/internal/proxy"
 )
 
@@ -26,11 +27,12 @@ type Server struct {
 	prog    *nql.Program
 	rings   map[string]*journal.Ring
 	svc     Services
+	alerts  *policy.AlertLog
 }
 
 // rings maps schema name to its journal; a schema with no ring isnt queryable
-func NewServer(zone string, prog *nql.Program, rings map[string]*journal.Ring, svc Services) *Server {
-	return &Server{zone: zone, started: time.Now(), prog: prog, rings: rings, svc: svc}
+func NewServer(zone string, prog *nql.Program, rings map[string]*journal.Ring, svc Services, alerts *policy.AlertLog) *Server {
+	return &Server{zone: zone, started: time.Now(), prog: prog, rings: rings, svc: svc, alerts: alerts}
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -40,6 +42,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/down", s.handleDown)
 	mux.HandleFunc("POST /api/expose", s.handleExpose)
 	mux.HandleFunc("GET /api/services", s.handleListServices)
+	mux.HandleFunc("GET /api/alerts", s.handleAlerts)
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -68,11 +71,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp := StatusResponse{
 		Zone:    s.zone,
 		Uptime:  time.Since(s.started).Round(time.Second).String(),
-		Ringlen: map[string]int{},
+		Ringlen: map[string]RingCounts{},
 		Schemas: map[string][]FieldInfo{},
 	}
 	for name, ring := range s.rings {
-		resp.Ringlen[name] = ring.Len()
+		resp.Ringlen[name] = RingCounts{Len: ring.Len(), Total: ring.Total()}
 	}
 	for _, sch := range s.prog.Schemas() {
 		fields := make([]FieldInfo, len(sch.Fields))
@@ -171,6 +174,15 @@ func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
 		out[i] = ServiceInfo{Name: svc.Name, Host: svc.Host, Target: svc.Target.String()}
 	}
 	writeJSON(w, http.StatusOK, ListServicesResponse{Services: out})
+}
+
+func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	recent := s.alerts.Recent(200)
+	alerts := make([]Alert, len(recent))
+	for i, a := range recent {
+		alerts[i] = Alert{TS: a.TS, Schema: a.Schema, Rule: a.Rule, Summary: a.Summary}
+	}
+	writeJSON(w, http.StatusOK, AlertsResponse{Alerts: alerts})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
