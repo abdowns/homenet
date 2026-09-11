@@ -1,5 +1,5 @@
-// filter name prefix decides behavior: deny_/alert_ on httprequest,
-// block_/alert_ on dnsquery, alert_ on authevent
+// filter name prefix decides behavior: deny_/allow_/public_/alert_ on
+// httprequest, block_/alert_ on dnsquery, alert_ on authevent
 package policy
 
 import (
@@ -18,9 +18,9 @@ type rule struct {
 type Policy struct {
 	prog *nql.Program
 
-	denyHTTP, alertHTTP []rule
-	blockDNS, alertDNS  []rule
-	alertAuth           []rule
+	denyHTTP, allowHTTP, publicHTTP, alertHTTP []rule
+	blockDNS, alertDNS                         []rule
+	alertAuth                                  []rule
 }
 
 // empty src compiles fine and denies nothing
@@ -39,6 +39,10 @@ func Compile(src string) (*Policy, error) {
 		switch {
 		case fi.SchemaName == "HttpRequest" && strings.HasPrefix(fi.Name, "deny_"):
 			p.denyHTTP = append(p.denyHTTP, r)
+		case fi.SchemaName == "HttpRequest" && strings.HasPrefix(fi.Name, "allow_"):
+			p.allowHTTP = append(p.allowHTTP, r)
+		case fi.SchemaName == "HttpRequest" && strings.HasPrefix(fi.Name, "public_"):
+			p.publicHTTP = append(p.publicHTTP, r)
 		case fi.SchemaName == "HttpRequest" && strings.HasPrefix(fi.Name, "alert_"):
 			p.alertHTTP = append(p.alertHTTP, r)
 		case fi.SchemaName == "DnsQuery" && strings.HasPrefix(fi.Name, "block_"):
@@ -58,7 +62,8 @@ func (p *Policy) Close() { p.prog.Close() }
 
 func (p *Policy) Summary() string {
 	alerts := len(p.alertHTTP) + len(p.alertDNS) + len(p.alertAuth)
-	return fmt.Sprintf("%d deny_, %d block_, %d alert_", len(p.denyHTTP), len(p.blockDNS), alerts)
+	return fmt.Sprintf("%d deny_, %d allow_, %d public_, %d block_, %d alert_",
+		len(p.denyHTTP), len(p.allowHTTP), len(p.publicHTTP), len(p.blockDNS), alerts)
 }
 
 func evalFirst(prog *nql.Program, schemaName string, rules []rule, fill func(buf *nql.Buf, i int)) (matched bool, name string) {
@@ -112,8 +117,20 @@ func fillAuth(e schema.AuthEvent) func(buf *nql.Buf, i int) {
 	return func(buf *nql.Buf, i int) { schema.PackAuthEvent(buf, i, e) }
 }
 
+func (p *Policy) IsPublicHTTP(r schema.HttpRequest) (bool, string) {
+	return evalFirst(p.prog, "HttpRequest", p.publicHTTP, fillHTTP(r))
+}
+
+// allow_ wins over deny_
 func (p *Policy) DenyHTTP(r schema.HttpRequest) (bool, string) {
-	return evalFirst(p.prog, "HttpRequest", p.denyHTTP, fillHTTP(r))
+	denied, name := evalFirst(p.prog, "HttpRequest", p.denyHTTP, fillHTTP(r))
+	if !denied {
+		return false, ""
+	}
+	if allowed, _ := evalFirst(p.prog, "HttpRequest", p.allowHTTP, fillHTTP(r)); allowed {
+		return false, ""
+	}
+	return true, name
 }
 
 func (p *Policy) AlertsHTTP(r schema.HttpRequest) []string {

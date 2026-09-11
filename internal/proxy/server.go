@@ -33,13 +33,18 @@ func CAHandler(authority *ca.CA) http.HandlerFunc {
 	}
 }
 
-func NewPlainServer(addr, httpsAddr string, authority *ca.CA) *http.Server {
+// pairHandler is mounted outside TLS too, so a brand new device can pair
+// before it has any reason to trust our certificate
+func NewPlainServer(addr, httpsAddr string, authority *ca.CA, pairPath string, pairHandler http.Handler) *http.Server {
 	suffix := httpsPortSuffix(httpsAddr)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ca", CAHandler(authority))
+	if pairPath != "" && pairHandler != nil {
+		mux.Handle(pairPath, pairHandler)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		host := StripPort(r.Host)
-		http.Redirect(w, r, "https://"+host+suffix+r.URL.RequestURI(), http.StatusPermanentRedirect)
+		target := "https://" + StripPort(r.Host) + suffix + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
 	return &http.Server{Addr: addr, Handler: mux}
 }

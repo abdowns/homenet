@@ -1,15 +1,11 @@
 package schema
 
-import (
-	"net"
-	"time"
-)
-
 // field order must match the structs below, keep in sync
 const Prelude = `
 schema DnsQuery {
   ts:       u64
   client:   ip4
+  device:   str
   name:     str
   qtype:    u16
   rcode:    u8
@@ -21,19 +17,33 @@ schema DnsQuery {
 schema HttpRequest {
   ts:      u64
   client:  ip4
+  device:  str
+  user:    str
   service: str
   host:    str
   method:  str
   path:    str
+  agent:   str
   status:  u16
   bytes:   u32
   ms:      f64
+  authed:  bool
+}
+
+schema AuthEvent {
+  ts:     u64
+  client: ip4
+  device: str
+  user:   str
+  kind:   str
+  ok:     bool
 }
 `
 
 type DnsQuery struct {
 	TS       uint64
 	Client   [4]byte
+	Device   string
 	Name     string
 	QType    uint16
 	RCode    uint8
@@ -46,25 +56,24 @@ type DnsQuery struct {
 type HttpRequest struct {
 	TS      uint64
 	Client  [4]byte
+	Device  string
+	User    string
 	Service string
 	Host    string
 	Method  string
 	Path    string
+	Agent   string
 	Status  uint16
 	Bytes   uint32
 	MS      float64
+	Authed  bool
 }
 
-func PackIP4(ip net.IP) [4]byte {
-	var out [4]byte
-	copy(out[:], ip.To4())
-	return out
-}
-
-func PackTS(t time.Time) uint64 {
-	return uint64(t.UnixNano())
-}
-
-func PackMS(d time.Duration) float64 {
-	return float64(d.Microseconds()) / 1000
+type AuthEvent struct {
+	TS     uint64
+	Client [4]byte
+	Device string
+	User   string
+	Kind   string // password, device pair, token
+	OK     bool
 }

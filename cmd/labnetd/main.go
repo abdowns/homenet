@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"labnet/internal/api"
+	"labnet/internal/auth"
 	"labnet/internal/ca"
 	labnetdns "labnet/internal/dns"
 	"labnet/internal/docker"
@@ -77,6 +79,27 @@ func run() error {
 		return fmt.Errorf("creating HTTP journal: %w", err)
 	}
 	defer httpRing.Close()
+	authRing, err := journal.NewRing(prog, "AuthEvent", journalCapacity)
+	if err != nil {
+		return fmt.Errorf("creating auth journal: %w", err)
+	}
+	defer authRing.Close()
+
+	authStore, err := auth.Open(filepath.Join(*dataDir, "auth.db"))
+	if err != nil {
+		return fmt.Errorf("opening auth database: %w", err)
+	}
+	defer authStore.Close()
+	bootstrapCode, err := authStore.EnsureBootstrapCode(context.Background(), 24*time.Hour)
+	if err != nil {
+		return fmt.Errorf("preparing pairing code: %w", err)
+	}
+	if bootstrapCode != "" {
+		log.Printf("labnetd: no devices paired yet — pairing code %s (valid 24h)", bootstrapCode)
+		log.Printf("labnetd: pair a device at http://%s%s%s or https://<any *.lab name>%s%s",
+			hostIP, portSuffix(*proxyPlainAddr), auth.PairPath, portSuffix(*proxyAddr), auth.PairPath)
+	}
+	gate := &auth.Gate{Store: authStore, CookieDomain: "." + *zone}
 
 	policyMgr, err := policy.NewManager(*policyFile)
 	if err != nil {
@@ -89,6 +112,16 @@ func run() error {
 			alertLog.Add(policy.Alert{TS: uint64(time.Now().UnixMilli()), Schema: schemaName, Rule: rule, Summary: summary})
 		}
 	}
+
+	pairHandler := auth.NewPairHandler(authStore, *zone, func(e auth.AuthEvent) {
+		var client [4]byte
+		if v4 := e.Client.To4(); v4 != nil {
+			copy(client[:], v4)
+		}
+		rec := schema.AuthEvent{TS: e.TS, Client: client, Device: e.Device, Kind: e.Kind, OK: e.OK}
+		authRing.Append(func(buf *nql.Buf, i int) { schema.PackAuthEvent(buf, i, rec) })
+		raiseAlerts("AuthEvent", policyMgr.Current().AlertsAuth(rec), fmt.Sprintf("device=%s kind=%s ok=%v", rec.Device, rec.Kind, rec.OK))
+	})
 
 	dnsHandler, err := labnetdns.NewHandler(labnetdns.Config{
 		Zone: *zone, HostIP: hostIP, Upstream: *upstream, Journal: dnsRing,
@@ -113,13 +146,15 @@ func run() error {
 	registry := proxy.NewRegistry()
 	proxyHandler := &proxy.Proxy{
 		Registry: registry, Journal: httpRing,
+		Authenticate: gate.Authenticate, PairPath: auth.PairPath, PairHandler: pairHandler,
 		Policy: func(r schema.HttpRequest) bool { denied, _ := policyMgr.Current().DenyHTTP(r); return denied },
+		Public: func(r schema.HttpRequest) bool { pub, _ := policyMgr.Current().IsPublicHTTP(r); return pub },
 		OnComplete: func(r schema.HttpRequest) {
 			raiseAlerts("HttpRequest", policyMgr.Current().AlertsHTTP(r), fmt.Sprintf("%s %s -> %d", r.Method, r.Path, r.Status))
 		},
 	}
 	tlsServer := proxy.NewTLSServer(*proxyAddr, proxyHandler, authority)
-	plainServer := proxy.NewPlainServer(*proxyPlainAddr, *proxyAddr, authority)
+	plainServer := proxy.NewPlainServer(*proxyPlainAddr, *proxyAddr, authority, auth.PairPath, pairHandler)
 
 	sdk := docker.NewSDKClient(*dockerSocket)
 	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -131,9 +166,10 @@ func run() error {
 	discovery := docker.NewDiscovery(sdk, registry, 5*time.Second)
 	log.Printf("labnetd: Docker discovery active on network %q", *dockerNetwork)
 
-	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing},
+	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing, "AuthEvent": authRing},
 		api.Services{Registry: registry, Docker: sdk, Discovery: discovery, DockerNetwork: *dockerNetwork},
 		api.PolicyDeps{Manager: policyMgr, Alerts: alertLog},
+		api.AuthDeps{Store: authStore},
 	)
 	apiServer := &http.Server{Addr: *apiAddr, Handler: apiHandler}
 
@@ -209,6 +245,14 @@ func detectHostIP() (net.IP, error) {
 	return nil, fmt.Errorf("no non-loopback IPv4 address found")
 }
 
+func portSuffix(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return ""
+	}
+	return ":" + port
+}
+
 func ruleSummary(rules map[string][]string) string {
 	total := 0
 	for _, names := range rules {
@@ -217,6 +261,6 @@ func ruleSummary(rules map[string][]string) string {
 	if total == 0 {
 		return "no rules — every request/query is allowed"
 	}
-	return fmt.Sprintf("%d deny_, %d allow_, %d block_, %d alert_ rule(s)",
-		len(rules["deny_"]), len(rules["allow_"]), len(rules["block_"]), len(rules["alert_"]))
+	return fmt.Sprintf("%d deny_, %d allow_, %d public_, %d block_, %d alert_ rule(s)",
+		len(rules["deny_"]), len(rules["allow_"]), len(rules["public_"]), len(rules["block_"]), len(rules["alert_"]))
 }
