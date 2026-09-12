@@ -18,16 +18,21 @@ type QueryResponse struct {
 }
 
 type StatusResponse struct {
-	Zone       string                `json:"zone"`
-	Uptime     string                `json:"uptime"`
-	Ringlen    map[string]RingCounts `json:"rings"`
-	Schemas    map[string][]string   `json:"schemas"`
-	AlertRules int                   `json:"alert_rules"`
+	Zone       string                 `json:"zone"`
+	Uptime     string                 `json:"uptime"`
+	Ringlen    map[string]RingCounts  `json:"rings"`
+	Schemas    map[string][]FieldInfo `json:"schemas"`
+	AlertRules int                    `json:"alert_rules"`
 }
 
 type RingCounts struct {
 	Len   int    `json:"len"`
 	Total uint64 `json:"total"`
+}
+
+type FieldInfo struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 type UpRequest struct {
@@ -63,6 +68,25 @@ type ListServicesResponse struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+type DeviceInfo struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	PairedAt string `json:"paired_at"`
+}
+
+type DevicesResponse struct {
+	Devices []DeviceInfo `json:"devices"`
+}
+
+type PairCodeRequest struct {
+	TTLSeconds int `json:"ttl_seconds,omitempty"` // default 600 (10 minutes)
+}
+
+type PairCodeResponse struct {
+	Code      string `json:"code"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 // mirrors policy.Alert, redeclared so this package skips importing internal/policy

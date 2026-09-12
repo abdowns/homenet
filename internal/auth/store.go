@@ -5,9 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -34,6 +37,11 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("auth: creating %s: %w", dir, err)
+		}
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("auth: opening %s: %w", path, err)
@@ -62,12 +70,19 @@ func randomHex(nbytes int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func (s *Store) DeviceCount(ctx context.Context) (int, error) {
-	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices`).Scan(&n); err != nil {
-		return 0, fmt.Errorf("auth: counting devices: %w", err)
+func randomCode() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("auth: generating pairing code: %w", err)
 	}
-	return n, nil
+	n := binary.BigEndian.Uint32(b[:]) % 1000000
+	return fmt.Sprintf("%06d", n), nil
+}
+
+func (s *Store) HasDevices(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices`).Scan(&n)
+	return n > 0, err
 }
 
 type Device struct {
@@ -77,9 +92,10 @@ type Device struct {
 }
 
 func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, paired_at FROM devices ORDER BY paired_at DESC`)
+	// rowid breaks ties when two devices pair in the same second
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, paired_at FROM devices ORDER BY paired_at DESC, rowid DESC`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("auth: listing devices: %w", err)
 	}
 	defer rows.Close()
 	var out []Device
@@ -87,7 +103,7 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 		var d Device
 		var pairedAt int64
 		if err := rows.Scan(&d.ID, &d.Name, &pairedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("auth: scanning device row: %w", err)
 		}
 		d.PairedAt = time.Unix(pairedAt, 0)
 		out = append(out, d)
@@ -95,23 +111,52 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) activeCode(ctx context.Context) (string, error) {
+	var code string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT code FROM pairing_codes WHERE used = 0 AND expires_at > ? ORDER BY expires_at DESC LIMIT 1`,
+		time.Now().Unix()).Scan(&code)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return code, err
+}
+
 func (s *Store) CreatePairingCode(ctx context.Context, ttl time.Duration) (string, error) {
-	code, err := randomHex(3)
+	for attempt := 0; attempt < 10; attempt++ {
+		code, err := randomCode()
+		if err != nil {
+			return "", err
+		}
+		_, err = s.db.ExecContext(ctx, `INSERT INTO pairing_codes (code, expires_at, used) VALUES (?, ?, 0)`,
+			code, time.Now().Add(ttl).Unix())
+		if err == nil {
+			return code, nil
+		}
+	}
+	return "", fmt.Errorf("auth: could not generate a unique pairing code after 10 attempts")
+}
+
+func (s *Store) EnsureBootstrapCode(ctx context.Context, ttl time.Duration) (string, error) {
+	has, err := s.HasDevices(ctx)
 	if err != nil {
 		return "", err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO pairing_codes (code, expires_at, used) VALUES (?, ?, 0)`,
-		code, time.Now().Add(ttl).Unix()); err != nil {
-		return "", fmt.Errorf("auth: storing pairing code: %w", err)
+	if has {
+		return "", nil
 	}
-	return code, nil
+	existing, err := s.activeCode(ctx)
+	if err != nil {
+		return "", err
+	}
+	if existing != "" {
+		return existing, nil
+	}
+	return s.CreatePairingCode(ctx, ttl)
 }
 
 // token is returned only once, the store keeps only its hash
 func (s *Store) RedeemPairingCode(ctx context.Context, code, deviceName string) (deviceID, token string, err error) {
-	if deviceName == "" {
-		return "", "", errors.New("auth: device name is required")
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", "", err
@@ -142,6 +187,9 @@ func (s *Store) RedeemPairingCode(ctx context.Context, code, deviceName string) 
 	token, err = randomHex(32)
 	if err != nil {
 		return "", "", err
+	}
+	if deviceName == "" {
+		deviceName = "device-" + id[:6]
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO devices (id, name, token_hash, paired_at) VALUES (?, ?, ?, ?)`,
 		id, deviceName, hashToken(token), time.Now().Unix()); err != nil {

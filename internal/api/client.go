@@ -97,8 +97,8 @@ func (c *Client) postJSON(path string, req, out any) error {
 	return nil
 }
 
-func (c *Client) Alerts(limit int) ([]Alert, error) {
-	resp, err := c.http.Get(fmt.Sprintf("%s/api/alerts?limit=%d", c.baseURL, limit))
+func (c *Client) Alerts() ([]Alert, error) {
+	resp, err := c.http.Get(c.baseURL + "/api/alerts")
 	if err != nil {
 		return nil, fmt.Errorf("labnetd unreachable at %s: %w", c.baseURL, err)
 	}
@@ -108,6 +108,28 @@ func (c *Client) Alerts(limit int) ([]Alert, error) {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
 	return out.Alerts, nil
+}
+
+func (c *Client) Devices() ([]DeviceInfo, error) {
+	resp, err := c.http.Get(c.baseURL + "/api/devices")
+	if err != nil {
+		return nil, fmt.Errorf("labnetd unreachable at %s: %w", c.baseURL, err)
+	}
+	defer resp.Body.Close()
+	var out DevicesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return out.Devices, nil
+}
+
+func (c *Client) PairCode(ttlSeconds int) (*PairCodeResponse, error) {
+	var out PairCodeResponse
+	req := map[string]int{"ttl_seconds": ttlSeconds}
+	if err := c.postJSON("/api/devices/pair-code", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (c *Client) Status() (*StatusResponse, error) {

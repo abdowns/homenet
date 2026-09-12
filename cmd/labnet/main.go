@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,6 +12,7 @@ import (
 	"time"
 
 	"labnet/internal/api"
+	"labnet/internal/auth"
 )
 
 func main() {
@@ -28,6 +32,10 @@ func run(args []string) error {
 
 	if len(args) == 0 {
 		return usageError()
+	}
+
+	if args[0] == "pair" {
+		return cmdPair(args[1:])
 	}
 
 	client := api.NewClient(apiAddr)
@@ -69,11 +77,15 @@ func usageError() error {
       Docker involved: labnet expose vite http://127.0.0.1:5173
   labnet ls
       list every registered service
+  labnet pair <code> [--name mydevice] [--pair-url http://host:port]
+      redeem a pairing code (shown by labnetd on first run, or minted by
+      an already-paired device) and print this device's bearer token
   labnet alerts
       show recent alert rule matches
 
 LABNET_API (default http://127.0.0.1:8080) sets the labnetd control API
-address.`)
+address (used by everything except pair). LABNET_PAIR_URL (default
+http://127.0.0.1:8000) sets where pair looks for the pairing endpoint.`)
 	return fmt.Errorf("no command given")
 }
 
@@ -81,12 +93,17 @@ func extractFlag(args []string, name, def string) ([]string, string) {
 	out := make([]string, 0, len(args))
 	val := def
 	for i := 0; i < len(args); i++ {
-		if args[i] == name && i+1 < len(args) {
+		a := args[i]
+		if a == name && i+1 < len(args) {
 			val = args[i+1]
 			i++
 			continue
 		}
-		out = append(out, args[i])
+		if v, ok := strings.CutPrefix(a, name+"="); ok {
+			val = v
+			continue
+		}
+		out = append(out, a)
 	}
 	return out, val
 }
@@ -115,6 +132,42 @@ func cmdQuery(client *api.Client, args []string) error {
 		}
 		fmt.Println(strings.Join(parts, "  "))
 	}
+	return nil
+}
+
+func cmdPair(args []string) error {
+	pairURL := os.Getenv("LABNET_PAIR_URL")
+	if pairURL == "" {
+		pairURL = "http://127.0.0.1:8000"
+	}
+	args, pairURL = extractFlag(args, "--pair-url", pairURL)
+	args, name := extractFlag(args, "--name", "")
+	if len(args) != 1 {
+		return fmt.Errorf("usage: labnet pair <code> [--name mydevice] [--pair-url http://host:port]")
+	}
+	code := args[0]
+
+	resp, err := http.PostForm(pairURL+auth.PairPath, url.Values{"code": {code}, "name": {name}})
+	if err != nil {
+		return fmt.Errorf("labnetd unreachable at %s: %w", pairURL, err)
+	}
+	defer resp.Body.Close()
+
+	var token string
+	for _, c := range resp.Cookies() {
+		if c.Name == auth.CookieName {
+			token = c.Value
+		}
+	}
+	if resp.StatusCode != http.StatusOK || token == "" {
+		io.Copy(io.Discard, resp.Body)
+		return fmt.Errorf("pairing failed (status %s) — bad or expired code?", resp.Status)
+	}
+
+	fmt.Println("paired! this device's bearer token (keep it secret):")
+	fmt.Println(token)
+	fmt.Println()
+	fmt.Println(`use it as: curl -H "Authorization: Bearer ` + token + `" https://<service>.lab/`)
 	return nil
 }
 

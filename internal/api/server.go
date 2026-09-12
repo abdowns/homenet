@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"time"
 
+	"labnet/internal/auth"
 	"labnet/internal/docker"
 	"labnet/internal/journal"
 	"labnet/internal/nql"
@@ -21,6 +22,10 @@ type Services struct {
 	DockerNetwork string
 }
 
+type AuthDeps struct {
+	Store *auth.Store
+}
+
 type Server struct {
 	zone    string
 	started time.Time
@@ -28,11 +33,12 @@ type Server struct {
 	rings   map[string]*journal.Ring
 	svc     Services
 	alerts  *policy.AlertLog
+	auth    AuthDeps
 }
 
 // rings maps schema name to its journal; a schema with no ring isnt queryable
-func NewServer(zone string, prog *nql.Program, rings map[string]*journal.Ring, svc Services, alerts *policy.AlertLog) *Server {
-	return &Server{zone: zone, started: time.Now(), prog: prog, rings: rings, svc: svc, alerts: alerts}
+func NewServer(zone string, prog *nql.Program, rings map[string]*journal.Ring, svc Services, alerts *policy.AlertLog, ad AuthDeps) *Server {
+	return &Server{zone: zone, started: time.Now(), prog: prog, rings: rings, svc: svc, alerts: alerts, auth: ad}
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -43,6 +49,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/expose", s.handleExpose)
 	mux.HandleFunc("GET /api/services", s.handleListServices)
 	mux.HandleFunc("GET /api/alerts", s.handleAlerts)
+	mux.HandleFunc("GET /api/devices", s.handleListDevices)
+	mux.HandleFunc("POST /api/devices/pair-code", s.handlePairCode)
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -168,19 +176,62 @@ func (s *Server) handleExpose(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
-	svcs := s.svc.Registry.List()
-	out := make([]ServiceInfo, len(svcs))
-	for i, svc := range svcs {
-		out[i] = ServiceInfo{Name: svc.Name, Host: svc.Host, Target: svc.Target.String()}
+	var out []ServiceInfo
+	if s.svc.Registry != nil {
+		for _, svc := range s.svc.Registry.List() {
+			out = append(out, ServiceInfo{Name: svc.Name, Host: svc.Host, Target: svc.Target.String()})
+		}
 	}
 	writeJSON(w, http.StatusOK, ListServicesResponse{Services: out})
 }
 
+func (s *Server) handleListDevices(w http.ResponseWriter, r *http.Request) {
+	if s.auth.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: "device auth is not configured"})
+		return
+	}
+	devices, err := s.auth.Store.ListDevices(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		return
+	}
+	out := make([]DeviceInfo, len(devices))
+	for i, d := range devices {
+		out[i] = DeviceInfo{ID: d.ID, Name: d.Name, PairedAt: d.PairedAt.Format(time.RFC3339)}
+	}
+	writeJSON(w, http.StatusOK, DevicesResponse{Devices: out})
+}
+
+func (s *Server) handlePairCode(w http.ResponseWriter, r *http.Request) {
+	if s.auth.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: "device auth is not configured"})
+		return
+	}
+	var req PairCodeRequest
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "bad request body: " + err.Error()})
+			return
+		}
+	}
+	ttl := time.Duration(req.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	code, err := s.auth.Store.CreatePairingCode(r.Context(), ttl)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, PairCodeResponse{Code: code, ExpiresAt: time.Now().Add(ttl).Format(time.RFC3339)})
+}
+
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
-	recent := s.alerts.Recent(200)
-	alerts := make([]Alert, len(recent))
-	for i, a := range recent {
-		alerts[i] = Alert{TS: a.TS, Schema: a.Schema, Rule: a.Rule, Summary: a.Summary}
+	var alerts []Alert
+	if s.alerts != nil {
+		for _, a := range s.alerts.Recent(200) {
+			alerts = append(alerts, Alert{TS: a.TS, Schema: a.Schema, Rule: a.Rule, Summary: a.Summary})
+		}
 	}
 	writeJSON(w, http.StatusOK, AlertsResponse{Alerts: alerts})
 }
