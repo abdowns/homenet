@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -24,6 +25,8 @@ import (
 	"labnet/internal/policy"
 	"labnet/internal/proxy"
 	"labnet/internal/schema"
+	"labnet/internal/sse"
+	"labnet/internal/web"
 )
 
 const journalCapacity = 1 << 16
@@ -101,6 +104,8 @@ func run() error {
 	}
 	gate := &auth.Gate{Store: authStore, CookieDomain: "." + *zone}
 
+	hub := sse.NewHub()
+
 	policyMgr, err := policy.NewManager(*policyFile)
 	if err != nil {
 		return fmt.Errorf("loading policy: %w", err)
@@ -109,7 +114,9 @@ func run() error {
 	raiseAlerts := func(schemaName string, names []string, summary string) {
 		for _, rule := range names {
 			log.Printf("labnetd: ALERT %s (%s): %s", rule, schemaName, summary)
-			alertLog.Add(policy.Alert{TS: uint64(time.Now().UnixMilli()), Schema: schemaName, Rule: rule, Summary: summary})
+			a := policy.Alert{TS: uint64(time.Now().UnixMilli()), Schema: schemaName, Rule: rule, Summary: summary}
+			alertLog.Add(a)
+			hub.Broadcast("alert", map[string]any{"ts": a.TS, "schema": a.Schema, "rule": a.Rule, "summary": a.Summary})
 		}
 	}
 
@@ -120,6 +127,9 @@ func run() error {
 		}
 		rec := schema.AuthEvent{TS: e.TS, Client: client, Device: e.Device, Kind: e.Kind, OK: e.OK}
 		authRing.Append(func(buf *nql.Buf, i int) { schema.PackAuthEvent(buf, i, rec) })
+		hub.Broadcast("auth", map[string]any{
+			"ts": rec.TS, "client": ip4String(rec.Client), "device": rec.Device, "kind": rec.Kind, "ok": rec.OK,
+		})
 		raiseAlerts("AuthEvent", policyMgr.Current().AlertsAuth(rec), fmt.Sprintf("device=%s kind=%s ok=%v", rec.Device, rec.Kind, rec.OK))
 	})
 
@@ -127,6 +137,10 @@ func run() error {
 		Zone: *zone, HostIP: hostIP, Upstream: *upstream, Journal: dnsRing,
 		Policy: func(q schema.DnsQuery) bool { blocked, _ := policyMgr.Current().BlockDNS(q); return blocked },
 		OnComplete: func(q schema.DnsQuery) {
+			hub.Broadcast("dns", map[string]any{
+				"ts": q.TS, "client": ip4String(q.Client), "name": q.Name, "qtype": q.QType,
+				"rcode": q.RCode, "blocked": q.Blocked, "upstream": q.Upstream, "ms": q.MS,
+			})
 			raiseAlerts("DnsQuery", policyMgr.Current().AlertsDNS(q), fmt.Sprintf("name=%s blocked=%v", q.Name, q.Blocked))
 		},
 	})
@@ -150,6 +164,10 @@ func run() error {
 		Policy: func(r schema.HttpRequest) bool { denied, _ := policyMgr.Current().DenyHTTP(r); return denied },
 		Public: func(r schema.HttpRequest) bool { pub, _ := policyMgr.Current().IsPublicHTTP(r); return pub },
 		OnComplete: func(r schema.HttpRequest) {
+			hub.Broadcast("http", map[string]any{
+				"ts": r.TS, "client": ip4String(r.Client), "device": r.Device, "service": r.Service, "host": r.Host,
+				"method": r.Method, "path": r.Path, "status": r.Status, "bytes": r.Bytes, "ms": r.MS, "authed": r.Authed,
+			})
 			raiseAlerts("HttpRequest", policyMgr.Current().AlertsHTTP(r), fmt.Sprintf("%s %s -> %d", r.Method, r.Path, r.Status))
 		},
 	}
@@ -166,12 +184,19 @@ func run() error {
 	discovery := docker.NewDiscovery(sdk, registry, 5*time.Second)
 	log.Printf("labnetd: Docker discovery active on network %q", *dockerNetwork)
 
-	apiHandler := api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing, "AuthEvent": authRing},
+	mux := http.NewServeMux()
+	api.NewServer(*zone, prog, map[string]*journal.Ring{"DnsQuery": dnsRing, "HttpRequest": httpRing, "AuthEvent": authRing},
 		api.Services{Registry: registry, Docker: sdk, Discovery: discovery, DockerNetwork: *dockerNetwork},
 		api.PolicyDeps{Manager: policyMgr, Alerts: alertLog},
 		api.AuthDeps{Store: authStore},
-	)
-	apiServer := &http.Server{Addr: *apiAddr, Handler: apiHandler}
+	).Register(mux)
+	mux.Handle("GET /api/events", hub)
+	dashboardFS, err := fs.Sub(web.FS, "static")
+	if err != nil {
+		return fmt.Errorf("labnetd bug: embedding dashboard assets: %w", err)
+	}
+	mux.Handle("/", http.FileServer(http.FS(dashboardFS)))
+	apiServer := &http.Server{Addr: *apiAddr, Handler: mux}
 
 	ctx, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
@@ -263,4 +288,8 @@ func ruleSummary(rules map[string][]string) string {
 	}
 	return fmt.Sprintf("%d deny_, %d allow_, %d public_, %d block_, %d alert_ rule(s)",
 		len(rules["deny_"]), len(rules["allow_"]), len(rules["public_"]), len(rules["block_"]), len(rules["alert_"]))
+}
+
+func ip4String(a [4]byte) string {
+	return fmt.Sprintf("%d.%d.%d.%d", a[0], a[1], a[2], a[3])
 }

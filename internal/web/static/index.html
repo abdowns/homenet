@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>labnet</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>labnet</h1>
+  <div id="summary">connecting…</div>
+</header>
+
+<nav id="tabs">
+  <button class="tab-btn active" data-tab="services">Services</button>
+  <button class="tab-btn" data-tab="journal">Journal</button>
+</nav>
+
+<main>
+
+<section id="tab-services" class="tab active">
+  <h2>Services</h2>
+  <table id="services-table"><thead><tr><th>Name</th><th>Host</th><th>Target</th></tr></thead><tbody></tbody></table>
+
+  <form id="expose-form">
+    <h3>Expose</h3>
+    <input name="name" required placeholder="name">
+    <input name="target" required placeholder="http://127.0.0.1:5173">
+    <input name="host" placeholder="host (optional)">
+    <button type="submit">Expose</button>
+    <div class="result"></div>
+  </form>
+
+  <form id="up-form">
+    <h3>Up (Dockerfile)</h3>
+    <input name="name" required placeholder="name">
+    <input name="dir" required placeholder="/path/to/project">
+    <button type="submit">Up</button>
+    <div class="result"></div>
+  </form>
+</section>
+
+<section id="tab-journal" class="tab">
+  <h2>Journal</h2>
+  <form id="query-form">
+    <select name="schema">
+      <option value="DnsQuery">DnsQuery</option>
+      <option value="HttpRequest">HttpRequest</option>
+    </select>
+    <input name="predicate" placeholder="predicate" size="40">
+    <button type="submit">Run query</button>
+  </form>
+  <div id="query-results"></div>
+</section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
