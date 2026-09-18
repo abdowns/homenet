@@ -16,22 +16,14 @@ import (
 const closeGrace = 10 * time.Second
 
 type Manager struct {
-	path    string
-	current atomic.Pointer[Policy]
+	path       string
+	current    atomic.Pointer[Policy]
+	currentSrc atomic.Pointer[string]
 }
 
 // missing file loads as an empty policy that denies nothing; invalid file errors
 func NewManager(path string) (*Manager, error) {
 	m := &Manager{path: path}
-	p, err := load(path)
-	if err != nil {
-		return nil, err
-	}
-	m.current.Store(p)
-	return m, nil
-}
-
-func load(path string) (*Policy, error) {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -43,18 +35,56 @@ func load(path string) (*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("policy: %s: %w", path, err)
 	}
-	return p, nil
+	m.current.Store(p)
+	srcStr := string(src)
+	m.currentSrc.Store(&srcStr)
+	return m, nil
 }
 
 func (m *Manager) Current() *Policy { return m.current.Load() }
 
+func (m *Manager) Source() string { return *m.currentSrc.Load() }
+
 func (m *Manager) Reload() error {
-	newPolicy, err := load(m.path)
+	src, err := os.ReadFile(m.path)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			src = nil // removed file reverts to a policy that denies nothing
+		} else {
+			return fmt.Errorf("policy: reading %s: %w", m.path, err)
+		}
+	}
+	newPolicy, err := Compile(string(src))
+	if err != nil {
+		return fmt.Errorf("policy: %s: %w", m.path, err)
 	}
 	old := m.current.Swap(newPolicy)
 	time.AfterFunc(closeGrace, old.Close)
+	srcStr := string(src)
+	m.currentSrc.Store(&srcStr)
+	return nil
+}
+
+// writes only after a successful compile, via tmp file plus rename, so a
+// concurrent watch triggered reload never sees a partial write
+func (m *Manager) Apply(src string) error {
+	p, err := Compile(src)
+	if err != nil {
+		return err
+	}
+	tmp := m.path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		p.Close()
+		return fmt.Errorf("policy: writing %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, m.path); err != nil {
+		p.Close()
+		return fmt.Errorf("policy: renaming %s to %s: %w", tmp, m.path, err)
+	}
+	old := m.current.Swap(p)
+	time.AfterFunc(closeGrace, old.Close)
+	srcCopy := src
+	m.currentSrc.Store(&srcCopy)
 	return nil
 }
 

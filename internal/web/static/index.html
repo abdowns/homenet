@@ -42,15 +42,27 @@
 
 <section id="tab-journal" class="tab">
   <h2>Journal</h2>
-  <form id="query-form">
+  <form id="query-form" class="inline-form">
     <select name="schema">
       <option value="DnsQuery">DnsQuery</option>
       <option value="HttpRequest">HttpRequest</option>
     </select>
-    <input name="predicate" placeholder="predicate" size="40">
+    <input name="predicate" placeholder='e.g. blocked  or  status &gt;= 400' size="40">
+    <input name="limit" type="number" placeholder="limit" size="4" style="width:5em">
     <button type="submit">Run query</button>
   </form>
+  <div id="query-stats"></div>
   <div id="query-results"></div>
+
+  <h3>Policy</h3>
+  <p>Filters named <code>deny_</code>/<code>allow_</code> act on HttpRequest, <code>block_</code> on DnsQuery.</p>
+  <textarea id="policy-source" spellcheck="false" rows="12"></textarea>
+  <div>
+    <button id="policy-check-btn">Check</button>
+    <button id="policy-test-btn">Test</button>
+    <button id="policy-apply-btn">Apply</button>
+  </div>
+  <pre id="policy-result"></pre>
 </section>
 
 </main>

@@ -1,19 +1,14 @@
 'use strict';
 
-async function apiGet(path) {
-  const res = await fetch(path);
-  if (!res.ok) throw new Error(`${path}: ${res.status}`);
-  return res.json();
-}
-async function apiPost(path, data) {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
+async function api(path, opts) {
+  const res = await fetch(path, opts);
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || `${path}: ${res.status}`);
   return body;
+}
+function apiGet(path) { return api(path); }
+function apiPost(path, data) {
+  return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
 }
 
 function el(tag, attrs, ...children) {
@@ -38,7 +33,7 @@ async function refreshSummary() {
     const rings = Object.entries(st.rings || {}).map(([k, v]) => `${k}: ${v.len}`).join('  ·  ');
     document.getElementById('summary').textContent = `zone ${st.zone}  ·  up ${st.uptime}  ·  ${rings}`;
   } catch (e) {
-    document.getElementById('summary').textContent = 'labnetd unreachable';
+    document.getElementById('summary').textContent = 'labnetd unreachable: ' + e.message;
   }
 }
 
@@ -123,6 +118,31 @@ document.getElementById('query-form').addEventListener('submit', async (ev) => {
 let liveRows = [];
 document.getElementById('live-toggle').addEventListener('change', () => { liveRows = []; });
 
+async function loadPolicy() {
+  const st = await apiGet('/api/policy/status');
+  document.getElementById('policy-source').value = st.source || '';
+}
+
+async function policyAction(path, describe) {
+  const out = document.getElementById('policy-result');
+  const source = document.getElementById('policy-source').value;
+  try {
+    const resp = await apiPost(path, { source });
+    out.className = resp.ok ? 'result ok' : 'result error';
+    out.textContent = resp.ok ? describe(resp) : resp.error;
+  } catch (e) {
+    out.className = 'result error';
+    out.textContent = e.message;
+  }
+}
+
+document.getElementById('policy-check-btn').addEventListener('click', () =>
+  policyAction('/api/policy/check', () => 'compiles ✓'));
+document.getElementById('policy-test-btn').addEventListener('click', () =>
+  policyAction('/api/policy/test', r => `would deny ${r.http.matched || 0} of ${r.http.total || 0} requests, block ${r.dns.matched || 0} of ${r.dns.total || 0} queries`));
+document.getElementById('policy-apply-btn').addEventListener('click', () =>
+  policyAction('/api/policy/apply', () => 'applied ✓'));
+
 function connectEvents() {
   const src = new EventSource('/api/events');
   for (const type of ['dns', 'http', 'auth']) {
@@ -137,5 +157,6 @@ function connectEvents() {
 
 refreshSummary();
 loadServices();
+loadPolicy();
 connectEvents();
 setInterval(refreshSummary, 10000);

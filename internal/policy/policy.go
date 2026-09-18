@@ -3,9 +3,10 @@
 package policy
 
 import (
-	"fmt"
 	"strings"
+	"unsafe"
 
+	"labnet/internal/journal"
 	"labnet/internal/nql"
 	"labnet/internal/schema"
 )
@@ -60,10 +61,21 @@ func Compile(src string) (*Policy, error) {
 
 func (p *Policy) Close() { p.prog.Close() }
 
-func (p *Policy) Summary() string {
-	alerts := len(p.alertHTTP) + len(p.alertDNS) + len(p.alertAuth)
-	return fmt.Sprintf("%d deny_, %d allow_, %d public_, %d block_, %d alert_",
-		len(p.denyHTTP), len(p.allowHTTP), len(p.publicHTTP), len(p.blockDNS), alerts)
+func (p *Policy) RuleNames() map[string][]string {
+	names := func(rs []rule) []string {
+		out := make([]string, len(rs))
+		for i, r := range rs {
+			out[i] = r.name
+		}
+		return out
+	}
+	return map[string][]string{
+		"deny_":   names(p.denyHTTP),
+		"allow_":  names(p.allowHTTP),
+		"public_": names(p.publicHTTP),
+		"block_":  names(p.blockDNS),
+		"alert_":  append(append(names(p.alertHTTP), names(p.alertDNS)...), names(p.alertAuth)...),
+	}
 }
 
 func evalFirst(prog *nql.Program, schemaName string, rules []rule, fill func(buf *nql.Buf, i int)) (matched bool, name string) {
@@ -147,4 +159,77 @@ func (p *Policy) AlertsDNS(q schema.DnsQuery) []string {
 
 func (p *Policy) AlertsAuth(e schema.AuthEvent) []string {
 	return evalAll(p.prog, "AuthEvent", p.alertAuth, fillAuth(e))
+}
+
+type TestResult struct {
+	HTTPTotal, HTTPDenied int
+	DNSTotal, DNSBlocked  int
+	DeniedBy, BlockedBy   map[string]int
+}
+
+func (p *Policy) TestHTTP(rows []schema.HttpRequest) TestResult {
+	res := TestResult{HTTPTotal: len(rows), DeniedBy: map[string]int{}, BlockedBy: map[string]int{}}
+	for _, r := range rows {
+		if denied, name := p.DenyHTTP(r); denied {
+			res.HTTPDenied++
+			res.DeniedBy[name]++
+		}
+	}
+	return res
+}
+
+func (p *Policy) TestDNS(rows []schema.DnsQuery) TestResult {
+	res := TestResult{DNSTotal: len(rows), DeniedBy: map[string]int{}, BlockedBy: map[string]int{}}
+	for _, q := range rows {
+		if blocked, name := p.BlockDNS(q); blocked {
+			res.DNSBlocked++
+			res.BlockedBy[name]++
+		}
+	}
+	return res
+}
+
+// safe because the ring's program and this policy's program were compiled
+// from the identical schema.Prelude text, so record layouts match byte for
+// byte despite being two separate nql.Program instances
+func (p *Policy) TestHTTPRing(ring *journal.Ring) TestResult {
+	res := TestResult{DeniedBy: map[string]int{}, BlockedBy: map[string]int{}}
+	ring.Scan(func(rec unsafe.Pointer) {
+		res.HTTPTotal++
+		denied, name := false, ""
+		for _, r := range p.denyHTTP {
+			if r.k.Pred(rec) {
+				denied, name = true, r.name
+				break
+			}
+		}
+		if denied {
+			for _, r := range p.allowHTTP {
+				if r.k.Pred(rec) {
+					denied = false
+					break
+				}
+			}
+		}
+		if denied {
+			res.HTTPDenied++
+			res.DeniedBy[name]++
+		}
+	})
+	return res
+}
+
+func (p *Policy) TestDNSRing(ring *journal.Ring) TestResult {
+	res := TestResult{DeniedBy: map[string]int{}, BlockedBy: map[string]int{}}
+	ring.Scan(func(rec unsafe.Pointer) {
+		res.DNSTotal++
+		for _, r := range p.blockDNS {
+			if r.k.Pred(rec) {
+				res.DNSBlocked++
+				res.BlockedBy[r.name]++
+				return
+			}
+		}
+	})
+	return res
 }

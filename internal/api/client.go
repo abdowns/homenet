@@ -97,6 +97,43 @@ func (c *Client) postJSON(path string, req, out any) error {
 	return nil
 }
 
+func (c *Client) PolicyCheck(src string) (*PolicyCheckResponse, error) {
+	var out PolicyCheckResponse
+	if err := c.postJSON("/api/policy/check", PolicySourceRequest{Source: src}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) PolicyTest(src string) (*PolicyTestResponse, error) {
+	var out PolicyTestResponse
+	if err := c.postJSON("/api/policy/test", PolicySourceRequest{Source: src}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) PolicyApply(src string) (*PolicyApplyResponse, error) {
+	var out PolicyApplyResponse
+	if err := c.postJSON("/api/policy/apply", PolicySourceRequest{Source: src}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) PolicyStatus() (*PolicyStatusResponse, error) {
+	resp, err := c.http.Get(c.baseURL + "/api/policy/status")
+	if err != nil {
+		return nil, fmt.Errorf("labnetd unreachable at %s: %w", c.baseURL, err)
+	}
+	defer resp.Body.Close()
+	var out PolicyStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return &out, nil
+}
+
 func (c *Client) Alerts() ([]Alert, error) {
 	resp, err := c.http.Get(c.baseURL + "/api/alerts")
 	if err != nil {
@@ -125,8 +162,7 @@ func (c *Client) Devices() ([]DeviceInfo, error) {
 
 func (c *Client) PairCode(ttlSeconds int) (*PairCodeResponse, error) {
 	var out PairCodeResponse
-	req := map[string]int{"ttl_seconds": ttlSeconds}
-	if err := c.postJSON("/api/devices/pair-code", req, &out); err != nil {
+	if err := c.postJSON("/api/devices/pair-code", PairCodeRequest{TTLSeconds: ttlSeconds}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

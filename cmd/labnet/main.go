@@ -52,6 +52,8 @@ func run(args []string) error {
 		return cmdExpose(client, args[1:])
 	case "ls":
 		return cmdList(client)
+	case "policy":
+		return cmdPolicy(client, args[1:])
 	case "alerts":
 		return cmdAlerts(client)
 	default:
@@ -80,8 +82,17 @@ func usageError() error {
   labnet pair <code> [--name mydevice] [--pair-url http://host:port]
       redeem a pairing code (shown by labnetd on first run, or minted by
       an already-paired device) and print this device's bearer token
+  labnet policy check <file>
+      compile a candidate policy.nql without applying it
+  labnet policy test <file>
+      show what a candidate policy.nql would deny/block against the
+      *current* journal, without applying it
+  labnet policy apply <file>
+      compile, persist, and hot-swap in a candidate policy.nql
+  labnet policy status
+      show the currently active policy's rules by category
   labnet alerts
-      show recent alert rule matches
+      show recent alert_* rule matches
 
 LABNET_API (default http://127.0.0.1:8080) sets the labnetd control API
 address (used by everything except pair). LABNET_PAIR_URL (default
@@ -233,6 +244,90 @@ func cmdList(client *api.Client) error {
 		fmt.Printf("%-20s https://%-24s -> %s\n", svc.Name, svc.Host, svc.Target)
 	}
 	return nil
+}
+
+func cmdPolicy(client *api.Client, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: labnet policy check|test|apply <file>, or labnet policy status")
+	}
+	if args[0] == "status" {
+		return cmdPolicyStatus(client)
+	}
+	if len(args) != 2 {
+		return fmt.Errorf("usage: labnet policy %s <file>", args[0])
+	}
+	src, err := os.ReadFile(args[1])
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", args[1], err)
+	}
+
+	switch args[0] {
+	case "check":
+		resp, err := client.PolicyCheck(string(src))
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		fmt.Println("ok")
+		printRuleNames(resp.Rules)
+		return nil
+
+	case "test":
+		resp, err := client.PolicyTest(string(src))
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		fmt.Printf("HTTP: would deny %d of %d requests currently in the journal\n", resp.HTTP.Matched, resp.HTTP.Total)
+		printByRule(resp.HTTP.ByRule)
+		fmt.Printf("DNS:  would block %d of %d queries currently in the journal\n", resp.DNS.Matched, resp.DNS.Total)
+		printByRule(resp.DNS.ByRule)
+		return nil
+
+	case "apply":
+		resp, err := client.PolicyApply(string(src))
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		fmt.Println("applied")
+		printRuleNames(resp.Rules)
+		return nil
+
+	default:
+		return fmt.Errorf("usage: labnet policy check|test|apply <file>, or labnet policy status")
+	}
+}
+
+func cmdPolicyStatus(client *api.Client) error {
+	resp, err := client.PolicyStatus()
+	if err != nil {
+		return err
+	}
+	printRuleNames(resp.Rules)
+	return nil
+}
+
+func printRuleNames(rules map[string][]string) {
+	for _, category := range []string{"deny_", "allow_", "public_", "block_", "alert_"} {
+		names := rules[category]
+		if len(names) == 0 {
+			continue
+		}
+		fmt.Printf("  %-8s %s\n", category, strings.Join(names, ", "))
+	}
+}
+
+func printByRule(byRule map[string]int) {
+	for rule, n := range byRule {
+		fmt.Printf("    %-30s %d\n", rule, n)
+	}
 }
 
 func cmdAlerts(client *api.Client) error {
