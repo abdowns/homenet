@@ -1,0 +1,32 @@
+# Example policy, copy to path --policy-file points to (default ./policies/policy.nql) 
+# labnetd hot reloads it
+# `labnet policy check example.nql` validates this without applying it
+# `labnet policy test example.nql` shows what it would have denied/blocked
+# `labnet policy apply example.nql` applies it
+
+# keep admin panel off lan
+filter deny_admin_off_lan(r: HttpRequest) {
+  r.service == "admin" and not (r.client in 192.168.1.0/24)
+}
+
+# but let specific oncall user in
+filter allow_oncall(r: HttpRequest) {
+  r.user == "oncall"
+}
+
+# webhooks work without paired device
+filter public_ci_hooks(r: HttpRequest) {
+  r.path startswith "/hooks/"
+}
+
+# basic ad/tracker blocking
+filter block_trackers(q: DnsQuery) {
+  q.name matches "*doubleclick*" or q.name matches "*.ads.*"
+}
+
+filter alert_slow_request(r: HttpRequest) {
+  r.ms > 2000.0
+}
+filter alert_failed_login(e: AuthEvent) {
+  not e.ok
+}
