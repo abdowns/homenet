@@ -2,42 +2,61 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>labnet</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
   <h1>labnet</h1>
-  <div id="summary">connecting…</div>
+  <div id="summary" class="muted">connecting…</div>
 </header>
 
 <nav id="tabs">
   <button class="tab-btn active" data-tab="services">Services</button>
+  <button class="tab-btn" data-tab="devices">Devices</button>
   <button class="tab-btn" data-tab="journal">Journal</button>
+  <button class="tab-btn" data-tab="policy">Policy</button>
+  <button class="tab-btn" data-tab="alerts">Alerts</button>
 </nav>
 
 <main>
 
 <section id="tab-services" class="tab active">
   <h2>Services</h2>
-  <table id="services-table"><thead><tr><th>Name</th><th>Host</th><th>Target</th></tr></thead><tbody></tbody></table>
+  <table id="services-table"><thead><tr><th>Name</th><th>Host</th><th>Target</th><th></th></tr></thead><tbody></tbody></table>
 
-  <form id="expose-form">
-    <h3>Expose</h3>
-    <input name="name" required placeholder="name">
-    <input name="target" required placeholder="http://127.0.0.1:5173">
-    <input name="host" placeholder="host (optional)">
-    <button type="submit">Expose</button>
-    <div class="result"></div>
-  </form>
+  <div class="panel-row">
+    <form id="expose-form" class="card">
+      <h3>Expose an existing backend</h3>
+      <label>Name <input name="name" required placeholder="myapp"></label>
+      <label>Target URL <input name="target" required placeholder="http://127.0.0.1:5173"></label>
+      <label>Host (optional) <input name="host" placeholder="myapp.lab"></label>
+      <button type="submit">Expose</button>
+      <div class="result"></div>
+    </form>
 
-  <form id="up-form">
-    <h3>Up (Dockerfile)</h3>
-    <input name="name" required placeholder="name">
-    <input name="dir" required placeholder="/path/to/project">
-    <button type="submit">Up</button>
-    <div class="result"></div>
-  </form>
+    <form id="up-form" class="card">
+      <h3>Build &amp; run from a Dockerfile</h3>
+      <p class="muted">Needs Docker on labnetd's own host; <code>dir</code> is a path on that host.</p>
+      <label>Name <input name="name" required placeholder="myapp"></label>
+      <label>Directory <input name="dir" required placeholder="/home/me/projects/myapp"></label>
+      <label>Port (optional) <input name="port" placeholder="80"></label>
+      <button type="submit">Up</button>
+      <div class="result"></div>
+    </form>
+  </div>
+</section>
+
+<section id="tab-devices" class="tab">
+  <h2>Devices</h2>
+  <table id="devices-table"><thead><tr><th>Name</th><th>Paired</th></tr></thead><tbody></tbody></table>
+
+  <div class="card">
+    <h3>Pair a new device</h3>
+    <button id="pair-code-btn">Generate pairing code</button>
+    <div id="pair-code-result"></div>
+  </div>
 </section>
 
 <section id="tab-journal" class="tab">
@@ -46,23 +65,33 @@
     <select name="schema">
       <option value="DnsQuery">DnsQuery</option>
       <option value="HttpRequest">HttpRequest</option>
+      <option value="AuthEvent">AuthEvent</option>
     </select>
     <input name="predicate" placeholder='e.g. blocked  or  status &gt;= 400' size="40">
     <input name="limit" type="number" placeholder="limit" size="4" style="width:5em">
     <button type="submit">Run query</button>
+    <label class="live-toggle"><input type="checkbox" id="live-toggle"> live</label>
   </form>
-  <div id="query-stats"></div>
+  <div id="query-stats" class="muted"></div>
   <div id="query-results"></div>
+</section>
 
-  <h3>Policy</h3>
-  <p>Filters named <code>deny_</code>/<code>allow_</code> act on HttpRequest, <code>block_</code> on DnsQuery.</p>
-  <textarea id="policy-source" spellcheck="false" rows="12"></textarea>
-  <div>
+<section id="tab-policy" class="tab">
+  <h2>Policy</h2>
+  <p class="muted">A filter's name prefix decides what it does: <code>deny_</code>/<code>allow_</code>/<code>public_</code> on
+    HttpRequest, <code>block_</code> on DnsQuery, <code>alert_</code> on any journaled schema.</p>
+  <textarea id="policy-source" spellcheck="false" rows="16"></textarea>
+  <div class="button-row">
     <button id="policy-check-btn">Check</button>
-    <button id="policy-test-btn">Test</button>
-    <button id="policy-apply-btn">Apply</button>
+    <button id="policy-test-btn">Test (what-if)</button>
+    <button id="policy-apply-btn" class="primary">Apply</button>
   </div>
-  <pre id="policy-result"></pre>
+  <div id="policy-result"></div>
+</section>
+
+<section id="tab-alerts" class="tab">
+  <h2>Alerts</h2>
+  <div id="alerts-list"></div>
 </section>
 
 </main>
