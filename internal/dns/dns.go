@@ -14,12 +14,15 @@ import (
 
 type PolicyFunc func(q schema.DnsQuery) (blocked bool)
 
+type DeviceOfFunc func(ip net.IP) string
+
 type Config struct {
 	Zone       string
 	HostIP     net.IP
 	Upstream   string
 	Journal    *journal.Ring
 	Policy     PolicyFunc
+	DeviceOf   DeviceOfFunc
 	OnComplete func(q schema.DnsQuery)
 }
 
@@ -29,6 +32,7 @@ type Handler struct {
 	upstream   string
 	journal    *journal.Ring
 	policy     PolicyFunc
+	deviceOf   DeviceOfFunc
 	onComplete func(q schema.DnsQuery)
 	client     *dns.Client
 }
@@ -46,17 +50,33 @@ func NewHandler(cfg Config) (*Handler, error) {
 		upstream:   cfg.Upstream,
 		journal:    cfg.Journal,
 		policy:     cfg.Policy,
+		deviceOf:   cfg.DeviceOf,
 		onComplete: cfg.OnComplete,
 		client:     &dns.Client{Timeout: 3 * time.Second},
 	}, nil
 }
 
-func clientIP4(w dns.ResponseWriter) [4]byte {
-	a, ok := w.RemoteAddr().(*net.UDPAddr)
-	if !ok || a.IP == nil {
+func clientIP(w dns.ResponseWriter) net.IP {
+	addr := w.RemoteAddr()
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a.IP
+	case *net.TCPAddr:
+		return a.IP
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return nil
+		}
+		return net.ParseIP(host)
+	}
+}
+
+func ipTo4(ip net.IP) [4]byte {
+	if ip == nil {
 		return [4]byte{}
 	}
-	v4 := a.IP.To4()
+	v4 := ip.To4()
 	if v4 == nil {
 		return [4]byte{} // ipv6 clients not represented, ip4 only for v1
 	}
@@ -71,7 +91,10 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 	rec := schema.DnsQuery{
 		TS:     uint64(t0.UnixMilli()),
-		Client: clientIP4(w),
+		Client: ipTo4(clientIP(w)),
+	}
+	if h.deviceOf != nil {
+		rec.Device = h.deviceOf(clientIP(w))
 	}
 
 	if len(r.Question) != 1 {

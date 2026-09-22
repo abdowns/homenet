@@ -29,8 +29,6 @@ import (
 	"labnet/internal/web"
 )
 
-const journalCapacity = 1 << 16
-
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "labnetd:", err)
@@ -54,6 +52,8 @@ func run() error {
 		"NQL policy file, hot-reloaded on save (see internal/policy); missing is treated as an empty, no-op policy")
 	dockerSocket := flag.String("docker-socket", "/var/run/docker.sock", "Docker Engine API socket path")
 	dockerNetwork := flag.String("docker-network", "labnet", "Docker network `labnet up` attaches services to")
+	segCap := flag.Int("journal-segment-capacity", 4096, "records per journal segment")
+	maxSegs := flag.Int("journal-max-segments", 64, "max segments per journal ring (0 evicts none)")
 	flag.Parse()
 
 	hostIP := net.ParseIP(*hostIPFlag)
@@ -72,17 +72,17 @@ func run() error {
 	}
 	defer prog.Close()
 
-	dnsRing, err := journal.NewRing(prog, "DnsQuery", journalCapacity)
+	dnsRing, err := journal.NewRing(prog, "DnsQuery", *segCap, *maxSegs)
 	if err != nil {
 		return fmt.Errorf("creating DNS journal: %w", err)
 	}
 	defer dnsRing.Close()
-	httpRing, err := journal.NewRing(prog, "HttpRequest", journalCapacity)
+	httpRing, err := journal.NewRing(prog, "HttpRequest", *segCap, *maxSegs)
 	if err != nil {
 		return fmt.Errorf("creating HTTP journal: %w", err)
 	}
 	defer httpRing.Close()
-	authRing, err := journal.NewRing(prog, "AuthEvent", journalCapacity)
+	authRing, err := journal.NewRing(prog, "AuthEvent", *segCap, *maxSegs)
 	if err != nil {
 		return fmt.Errorf("creating auth journal: %w", err)
 	}
@@ -102,7 +102,7 @@ func run() error {
 		log.Printf("labnetd: pair a device at http://%s%s%s or https://<any *.lab name>%s%s",
 			hostIP, portSuffix(*proxyPlainAddr), auth.PairPath, portSuffix(*proxyAddr), auth.PairPath)
 	}
-	gate := &auth.Gate{Store: authStore, CookieDomain: "." + *zone}
+	gate := &auth.Gate{Store: authStore}
 
 	hub := sse.NewHub()
 
@@ -121,11 +121,7 @@ func run() error {
 	}
 
 	pairHandler := auth.NewPairHandler(authStore, *zone, func(e auth.AuthEvent) {
-		var client [4]byte
-		if v4 := e.Client.To4(); v4 != nil {
-			copy(client[:], v4)
-		}
-		rec := schema.AuthEvent{TS: e.TS, Client: client, Device: e.Device, Kind: e.Kind, OK: e.OK}
+		rec := schema.AuthEvent{TS: e.TS, Client: ipTo4(e.Client), Device: e.Device, Kind: e.Kind, OK: e.OK}
 		authRing.Append(func(buf *nql.Buf, i int) { schema.PackAuthEvent(buf, i, rec) })
 		hub.Broadcast("auth", map[string]any{
 			"ts": rec.TS, "client": ip4String(rec.Client), "device": rec.Device, "kind": rec.Kind, "ok": rec.OK,
@@ -138,7 +134,7 @@ func run() error {
 		Policy: func(q schema.DnsQuery) bool { blocked, _ := policyMgr.Current().BlockDNS(q); return blocked },
 		OnComplete: func(q schema.DnsQuery) {
 			hub.Broadcast("dns", map[string]any{
-				"ts": q.TS, "client": ip4String(q.Client), "name": q.Name, "qtype": q.QType,
+				"ts": q.TS, "client": ip4String(q.Client), "device": q.Device, "name": q.Name, "qtype": q.QType,
 				"rcode": q.RCode, "blocked": q.Blocked, "upstream": q.Upstream, "ms": q.MS,
 			})
 			raiseAlerts("DnsQuery", policyMgr.Current().AlertsDNS(q), fmt.Sprintf("name=%s blocked=%v", q.Name, q.Blocked))
@@ -292,4 +288,15 @@ func ruleSummary(rules map[string][]string) string {
 
 func ip4String(a [4]byte) string {
 	return fmt.Sprintf("%d.%d.%d.%d", a[0], a[1], a[2], a[3])
+}
+
+func ipTo4(ip net.IP) [4]byte {
+	if ip == nil {
+		return [4]byte{}
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return [4]byte{}
+	}
+	return [4]byte{v4[0], v4[1], v4[2], v4[3]}
 }

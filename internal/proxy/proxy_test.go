@@ -23,7 +23,7 @@ func newRing(t *testing.T) *journal.Ring {
 		t.Fatalf("compile prelude: %v", err)
 	}
 	t.Cleanup(func() { prog.Close() })
-	ring, err := journal.NewRing(prog, "HttpRequest", 16)
+	ring, err := journal.NewRing(prog, "HttpRequest", 16, 4)
 	if err != nil {
 		t.Fatalf("NewRing: %v", err)
 	}
@@ -46,6 +46,7 @@ func TestRoutingAndJournaling(t *testing.T) {
 	p := &Proxy{Registry: reg, Journal: ring}
 
 	req := httptest.NewRequest(http.MethodGet, "http://hello.lab/foo", nil)
+	req.RemoteAddr = "10.0.0.5:12345"
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, req)
 
@@ -113,8 +114,8 @@ func TestAuthenticateGate(t *testing.T) {
 	p := &Proxy{
 		Registry: reg,
 		Journal:  newRing(t),
-		Authenticate: func(token string) (string, bool) {
-			return "phone", token == "good-token"
+		Authenticate: func(r *http.Request) (string, string, bool) {
+			return "dev1", "phone", r.Header.Get("Authorization") == "Bearer good-token"
 		},
 	}
 
@@ -187,7 +188,7 @@ func TestPublicBypassesAuthenticateButNotPolicy(t *testing.T) {
 	p := &Proxy{
 		Registry:     reg,
 		Journal:      newRing(t),
-		Authenticate: func(token string) (string, bool) { return "", false },
+		Authenticate: func(r *http.Request) (string, string, bool) { return "", "", false },
 		Public:       func(r schema.HttpRequest) bool { return strings.HasPrefix(r.Path, "/hooks/") },
 	}
 
@@ -206,6 +207,35 @@ func TestPublicBypassesAuthenticateButNotPolicy(t *testing.T) {
 	}
 }
 
+func TestOnCompleteCalledWithFinishedRecord(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("abc"))
+	}))
+	defer backend.Close()
+	target, _ := url.Parse(backend.URL)
+
+	reg := NewRegistry()
+	reg.Register("app", "app.lab", target)
+
+	var got schema.HttpRequest
+	var calls int
+	p := &Proxy{
+		Registry:   reg,
+		OnComplete: func(r schema.HttpRequest) { got = r; calls++ },
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://app.lab/x", nil)
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	if calls != 1 {
+		t.Fatalf("OnComplete called %d times, want 1", calls)
+	}
+	if got.Status != http.StatusCreated || got.Bytes != 3 || got.Service != "app" {
+		t.Errorf("OnComplete record = %+v, want Status=201 Bytes=3 Service=app", got)
+	}
+}
+
 func TestPairPathBypassesEverything(t *testing.T) {
 	pairHit := false
 	pairHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +246,7 @@ func TestPairPathBypassesEverything(t *testing.T) {
 	p := &Proxy{
 		Registry:     NewRegistry(),
 		Journal:      newRing(t),
-		Authenticate: func(token string) (string, bool) { return "", false },
+		Authenticate: func(r *http.Request) (string, string, bool) { return "", "", false },
 		PairPath:     "/_labnet/pair",
 		PairHandler:  pairHandler,
 	}

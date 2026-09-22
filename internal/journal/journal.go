@@ -13,11 +13,6 @@ import (
 	"labnet/internal/schema"
 )
 
-const (
-	segCap  = 4096
-	maxSegs = 16
-)
-
 type FieldValue struct {
 	Name  string
 	Value any
@@ -100,25 +95,30 @@ type Ring struct {
 	mu         sync.RWMutex
 	schemaName string
 	sch        *nql.Schema
+	segCap     int
+	maxSegs    int
 	segs       []*segment // oldest first
 	total      uint64
 }
 
-func NewRing(prog *nql.Program, schemaName string) (*Ring, error) {
+func NewRing(prog *nql.Program, schemaName string, segCap, maxSegs int) (*Ring, error) {
 	sch, ok := prog.Schema(schemaName)
 	if !ok {
 		return nil, fmt.Errorf("journal: no such schema %q", schemaName)
 	}
-	return &Ring{schemaName: schemaName, sch: sch}, nil
+	if segCap < 1 || maxSegs < 1 {
+		return nil, fmt.Errorf("journal: segCap and maxSegs must be >= 1")
+	}
+	return &Ring{schemaName: schemaName, sch: sch, segCap: segCap, maxSegs: maxSegs}, nil
 }
 
 func (r *Ring) Append(fill func(buf *nql.Buf, i int)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(r.segs) == 0 || r.segs[len(r.segs)-1].count >= segCap {
-		r.segs = append(r.segs, &segment{buf: nql.NewBuf(r.sch, segCap)})
-		if len(r.segs) > maxSegs {
+	if len(r.segs) == 0 || r.segs[len(r.segs)-1].count >= r.segCap {
+		r.segs = append(r.segs, &segment{buf: nql.NewBuf(r.sch, r.segCap)})
+		if len(r.segs) > r.maxSegs {
 			r.segs[0].buf.Free()
 			r.segs = r.segs[1:]
 		}
@@ -162,6 +162,18 @@ func (r *Ring) Count(k nql.Kernels) uint64 {
 		total += k.Count(s.buf.Base(), uint64(s.count))
 	}
 	return total
+}
+
+// fn must not retain rec past the call: a concurrent append can free the
+// segment. must not call back into ring.
+func (r *Ring) Scan(fn func(rec unsafe.Pointer)) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.segs {
+		for i := 0; i < s.count; i++ {
+			fn(s.buf.Rec(i))
+		}
+	}
 }
 
 func (r *Ring) Query(predicate string, limit int) ([]Row, QueryStats, error) {
